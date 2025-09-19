@@ -9,7 +9,7 @@ from pydantic import BaseModel
 import sqlalchemy as sa
 import sqlalchemy.exc as sa_exc
 from sqlalchemy import text
-from pgvector.psycopg import register_vector, Vector
+from pgvector.psycopg import register_vector  # <— no Vector import
 import os, time, random, re, json, math, datetime
 
 # import the ingester so we can refresh URLs/FOAs on demand
@@ -187,12 +187,12 @@ def retrieve_top_chunks(query: str, k: int = 6, foa_hint: str = None):
     3) Else pure vector
     Then MMR to diversify results.
     """
-    qe = embed_query(query)
+    qe = embed_query(query)  # Python list
     topN = max(12, k * 4)
 
     with engine.begin() as conn:
         raw = conn.connection.driver_connection
-        register_vector(raw)
+        register_vector(raw)  # enables list<->vector adaptation
 
         def candidates_sql(where_extra: str = "", params: dict = None):
             params = params or {}
@@ -204,7 +204,7 @@ def retrieve_top_chunks(query: str, k: int = 6, foa_hint: str = None):
                 {where_extra}
                 ORDER BY e.embedding <-> :qe
                 LIMIT :n
-            """), {"qe": Vector(qe), "n": topN, **params}).fetchall()
+            """), {"qe": qe, "n": topN, **params}).fetchall()  # pass list directly
             return [{"content": r.content, "title": r.title, "url": r.url, "emb": _to_list(r.emb)} for r in rows]
 
         # 1) FOA-focused
@@ -248,26 +248,6 @@ class AskRagResponse(BaseModel):
     answer: str
     sources: list
 
-# ---- Usage logging helper ----------------------------------------------------
-def log_interaction(question: str, answer: str, foa_hint: str, sources: list, latency_ms: int, ok: bool, model: str):
-    """Fire-and-forget insert; never break the request if logging fails."""
-    try:
-        with engine.begin() as conn:
-            conn.execute(text("""
-                INSERT INTO interactions (question, answer_preview, foa_hint, sources, latency_ms, ok, model)
-                VALUES (:q, :a, :foa, CAST(:sources AS jsonb), :lat, :ok, :model)
-            """), {
-                "q": (question or "")[:4000],
-                "a": (answer or "")[:500],
-                "foa": foa_hint,
-                "sources": json.dumps(sources or []),
-                "lat": int(latency_ms) if latency_ms is not None else None,
-                "ok": bool(ok),
-                "model": model,
-            })
-    except Exception:
-        pass  # never bubble up
-
 SYSTEM_PROMPT_RAG = (
     "You are an NIH grants application assistant. Use ONLY the provided context to answer. "
     "If the answer depends on a specific FOA/NOFO, state that those instructions supersede general guidance. "
@@ -301,42 +281,28 @@ def ask_rag(req: AskRequest):
 
     rows = retrieve_top_chunks(q, k=6, foa_hint=foa_hint)
     if not rows:
-        # log a miss
-        log_interaction(q, "No relevant NIH pages found in the index yet.", foa_hint, [], 0, False, "gpt-4o-mini")
         return AskRagResponse(answer="No relevant NIH pages found in the index yet.", sources=[])
 
     context, cites = build_context(rows)
     user_msg = f"User question:\n{q}\n\nContext:\n{meta_block}{context}\n\nReturn a concise, policy-accurate answer with inline [#] citations."
 
-    model_name = "gpt-4o-mini"
-    start = time.perf_counter()
-    last_err = None
     for attempt in range(5):
         try:
             chat = client.chat.completions.create(
-                model=model_name,
+                model="gpt-4o-mini",
                 messages=[
                     {"role":"system","content":SYSTEM_PROMPT_RAG},
                     {"role":"user","content":user_msg}
                 ],
                 temperature=0.1,
             )
-            latency_ms = int((time.perf_counter() - start) * 1000)
-            answer_text = chat.choices[0].message.content.strip()
-            # log success
-            log_interaction(q, answer_text, foa_hint, cites, latency_ms, True, model_name)
-            return AskRagResponse(answer=answer_text, sources=cites)
+            return AskRagResponse(answer=chat.choices[0].message.content.strip(), sources=cites)
         except Exception as e:
-            last_err = str(e)
-            if attempt < 4 and any(x in last_err for x in ["RateLimit","429","ServiceUnavailable","Timeout"]):
+            msg = str(e)
+            if attempt < 4 and any(x in msg for x in ["RateLimit","429","ServiceUnavailable","Timeout"]):
                 time.sleep((0.5*(2**attempt)) + random.uniform(0,0.25))
                 continue
-            break
-
-    # final failure
-    latency_ms = int((time.perf_counter() - start) * 1000)
-    log_interaction(q, f"LLM error: {last_err}", foa_hint, cites, latency_ms, False, model_name)
-    raise HTTPException(status_code=503, detail=f"LLM error: {type(e).__name__ if 'e' in locals() else 'Unknown'}")
+            raise HTTPException(status_code=503, detail=f"LLM error: {type(e).__name__}")
 
 # ----- Admin: stats (protected) -----
 @app.get("/admin/stats", dependencies=[Depends(require_admin)])
@@ -384,53 +350,22 @@ def admin_changes(limit: int = 50):
         })
     return out
 
-# ----- Admin: interactions viewer (protected) -----
-@app.get("/admin/interactions", dependencies=[Depends(require_admin)])
-def admin_interactions(limit: int = 50):
-    with engine.begin() as conn:
-        rows = conn.execute(text("""
-            SELECT id, asked_at, question, answer_preview, foa_hint, sources, latency_ms, ok, model
-            FROM interactions
-            ORDER BY asked_at DESC
-            LIMIT :n
-        """), {"n": limit}).fetchall()
-    out = []
-    for r in rows:
-        src = r.sources
-        if isinstance(src, str):
-            try:
-                src = json.loads(src)
-            except Exception:
-                src = []
-        out.append({
-            "id": r.id,
-            "asked_at": r.asked_at.isoformat() if hasattr(r.asked_at, "isoformat") else str(r.asked_at),
-            "question": r.question,
-            "answer_preview": r.answer_preview,
-            "foa_hint": r.foa_hint,
-            "sources": src,
-            "latency_ms": r.latency_ms,
-            "ok": r.ok,
-            "model": r.model,
-        })
-    return out
-
 # ----- Admin: on-demand ingest/refresh (protected) -----
 def guess_foa_url(foa_number: str):
     """Return likely NIH Guide URL(s) for a given FOA/Notice number."""
     n = foa_number.upper()
     if n.startswith("RFA-"):
-        return [f"https://grants.nih.gov/grants/guide/rfa-files/{n}.htm",
-                f"https://grants.nih.gov/grants/guide/rfa-files/{n}.html"]
+            return [f"https://grants.nih.gov/grants/guide/rfa-files/{n}.htm",
+                    f"https://grants.nih.gov/grants/guide/rfa-files/{n}.html"]
     if n.startswith("PA-"):
-        return [f"https://grants.nih.gov/grants/guide/pa-files/{n}.htm",
-                f"https://grants.nih.gov/grants/guide/pa-files/{n}.html"]
+            return [f"https://grants.nih.gov/grants/guide/pa-files/{n}.htm",
+                    f"https://grants.nih.gov/grants/guide/pa-files/{n}.html"]
     if n.startswith("PAR-"):
-        return [f"https://grants.nih.gov/grants/guide/par-files/{n}.htm",
-                f"https://grants.nih.gov/grants/guide/par-files/{n}.html"]
+            return [f"https://grants.nih.gov/grants/guide/par-files/{n}.htm",
+                    f"https://grants.nih.gov/grants/guide/par-files/{n}.html"]
     if n.startswith("NOT-"):
-        return [f"https://grants.nih.gov/grants/guide/notice-files/{n}.htm",
-                f"https://grants.nih.gov/grants/guide/notice-files/{n}.html"]
+            return [f"https://grants.nih.gov/grants/guide/notice-files/{n}.htm",
+                    f"https://grants.nih.gov/grants/guide/notice-files/{n}.html"]
     return []
 
 class RefreshResponse(BaseModel):
