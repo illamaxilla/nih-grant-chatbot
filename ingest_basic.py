@@ -15,7 +15,29 @@ from bs4 import BeautifulSoup
 import sqlalchemy as sa
 from sqlalchemy import text
 from dotenv import load_dotenv
-import tiktoken
+
+# --- optional tiktoken shim (so deploys work even if it's not installed) ---
+try:
+    import tiktoken  # real package
+except Exception:
+    import re
+    _WORD_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
+
+    class _StubTiktoken:
+        def get_encoding(self, name: str):
+            class _Enc:
+                def encode(self, s: str):
+                    # Return a token-like list (words & punctuation) so len(encode(...)) still works
+                    return _WORD_RE.findall(s or "")
+            return _Enc()
+
+        # Some code uses encoding_for_model; map it to get_encoding.
+        def encoding_for_model(self, name: str):
+            return self.get_encoding(name)
+
+    tiktoken = _StubTiktoken()
+# --- end shim ---
+
 from openai import OpenAI
 from pgvector.psycopg import register_vector, Vector
 from pdfminer.high_level import extract_text as pdf_extract_text
