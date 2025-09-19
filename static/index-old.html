@@ -1,0 +1,268 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01//EN" "http://www.w3.org/TR/html4/strict.dtd">
+<html>
+<head>
+  <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+  <meta http-equiv="Content-Style-Type" content="text/css">
+  <title></title>
+  <meta name="Generator" content="Cocoa HTML Writer">
+  <meta name="CocoaVersion" content="2113.65">
+  <style type="text/css">
+    p.p1 {margin: 0.0px 0.0px 0.0px 0.0px; font: 12.0px Helvetica; color: #000000; -webkit-text-stroke: #000000}
+    p.p2 {margin: 0.0px 0.0px 0.0px 0.0px; font: 12.0px Helvetica; color: #000000; -webkit-text-stroke: #000000; min-height: 14.0px}
+    span.s1 {font-kerning: none}
+  </style>
+</head>
+<body>
+<p class="p1"><span class="s1">&lt;!doctype html&gt;</span></p>
+<p class="p1"><span class="s1">&lt;html lang="en"&gt;</span></p>
+<p class="p1"><span class="s1">&lt;head&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">  </span>&lt;meta charset="utf-8" /&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">  </span>&lt;meta name="viewport" content="width=device-width,initial-scale=1" /&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">  </span>&lt;title&gt;NIH Grants Chatbot&lt;/title&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">  </span>&lt;style&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>:root { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; color-scheme: dark; }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>body { margin: 0; background: #0b1020; color: #e8ecf1; }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>header { padding: 16px 20px; border-bottom: 1px solid #1e2438; background: #0f1630; position: sticky; top: 0; z-index: 10; }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>h1 { margin: 0; font-size: 18px; font-weight: 600; letter-spacing:.2px; }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>.container { max-width: 1100px; margin: 0 auto; padding: 20px; display: grid; grid-template-columns: 320px 1fr; gap: 16px; }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>.card { background: #121a3a; border: 1px solid #1e274d; border-radius: 12px; padding: 16px; }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>.chat { display: flex; flex-direction: column; gap: 12px; }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>.msg { padding: 12px 14px; border-radius: 12px; line-height: 1.6; white-space: pre-wrap; }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>.msg.user { align-self: flex-end; background: #2b3a80; }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>.msg.bot<span class="Apple-converted-space">  </span>{ align-self: flex-start; background: #151f45; }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>.sources { margin-top: 10px; font-size: 14px; opacity: 0.95; }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>.sources a { color: #9ecbff; text-decoration: none; }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>.sources a:hover { text-decoration: underline; }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>.row { display: grid; grid-template-columns: 1fr auto; gap: 10px; }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>textarea { width: 100%; min-height: 90px; resize: vertical; padding: 12px; background: #0e1533; color: #e8ecf1; border: 1px solid #233064; border-radius: 10px; }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>button { padding: 10px 16px; border-radius: 10px; border: 1px solid #2e3c78; background: #243373; color: #e8ecf1; cursor: pointer; font-weight: 600; }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>button:disabled { opacity: 0.6; cursor: not-allowed; }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>.hint { color: #c9d6f0; opacity: .8; font-size: 13px; }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>.pill { display: inline-flex; align-items: center; gap: 8px; padding: 8px 10px; background:#0f1a49; border:1px solid #2a3c8a; border-radius: 999px; font-size: 13px; }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>.muted { opacity:.8 }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>.list { display: flex; flex-direction: column; gap: 8px; max-height: 280px; overflow: auto; }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>.item { padding: 10px; border-radius: 10px; border:1px solid #1e274d; background:#0f1636; cursor: pointer; }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>.item:hover { background:#17215a; }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>.inline-code { font-family: ui-monospace,SFMono-Regular,Menlo,monospace; background:#0e1533; padding: 1px 6px; border-radius:6px; border:1px solid #233064; }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>.loader { display:none; margin-left:10px; }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>.loader.on { display:inline-block; animation: spin 1s linear infinite; border:3px solid #3d4b89; border-top-color:#9ecbff; border-radius:50%; width:16px; height:16px; vertical-align: middle; }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>@keyframes spin { to { transform: rotate(360deg); } }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>.foa-card { margin-top: 8px; padding: 12px; border-radius: 10px; background:#0f193f; border:1px solid #233064; font-size:14px; }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>.foa-card .row2 { display:grid; grid-template-columns: repeat(2,1fr); gap:8px; margin-top:8px; }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>.chips { display:flex; gap:6px; flex-wrap: wrap; margin-top:6px; }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>.chip { padding:3px 8px; border-radius:999px; background:#18225a; border:1px solid #2b3a80; font-size:12px; }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>.suggest { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>.suggest button { background:#18225a; border-color:#2b3a80; font-weight:500; }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>@media (max-width: 1000px){ .container { grid-template-columns: 1fr; } }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">  </span>&lt;/style&gt;</span></p>
+<p class="p1"><span class="s1">&lt;/head&gt;</span></p>
+<p class="p1"><span class="s1">&lt;body&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">  </span>&lt;header&gt;&lt;h1&gt;NIH Grants Chatbot&lt;/h1&gt;&lt;/header&gt;</span></p>
+<p class="p2"><span class="s1"></span><br></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">  </span>&lt;div class="container"&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>&lt;!-- LEFT PANE: FOA Quick Search --&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>&lt;div class="card"&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>&lt;h3 style="margin:0 0 10px 0;"&gt;Quick FOA Search&lt;/h3&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>&lt;input id="foa-q" placeholder="Type RFA-, PAR-, PA-, NOT-..." style="width:100%;padding:10px;border-radius:8px;border:1px solid #243373;background:#0e1533;color:#e8ecf1"/&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>&lt;div id="foa-list" class="list" style="margin-top:10px;"&gt;&lt;/div&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>&lt;div class="hint" style="margin-top:10px"&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>Click a result to insert the FOA number into your question.</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>&lt;/div&gt;</span></p>
+<p class="p2"><span class="s1"></span><br></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>&lt;div style="height:16px"&gt;&lt;/div&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>&lt;h3 style="margin:0 0 10px 0;"&gt;Starter Questions&lt;/h3&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>&lt;div class="suggest"&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>&lt;button data-q="What is the page limit for the Specific Aims section?"&gt;Specific Aims page limit&lt;/button&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>&lt;button data-q="What are the required elements of an NIH DMS Plan?"&gt;DMS Plan requirements&lt;/button&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>&lt;button data-q="For RFA-DA-27-004, what are the application due dates and are clinical trials allowed?"&gt;Due dates + CT for RFA&lt;/button&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>&lt;button data-q="What goes in the Modular Budget vs R&amp;R Budget forms?"&gt;Modular vs R&amp;R Budget&lt;/button&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>&lt;button data-q="Which human subjects and clinical trial forms are required?"&gt;Human Subjects/CT forms&lt;/button&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>&lt;/div&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>&lt;/div&gt;</span></p>
+<p class="p2"><span class="s1"></span><br></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>&lt;!-- RIGHT PANE: Chat --&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>&lt;div&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>&lt;div id="foa-meta"&gt;&lt;/div&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>&lt;div id="chat" class="chat"&gt;&lt;/div&gt;</span></p>
+<p class="p2"><span class="s1"></span><br></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>&lt;div class="card" style="margin-top:14px;"&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>&lt;form id="ask-form" class="row"&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">          </span>&lt;textarea id="q" placeholder="Ask about NIH Application Guide, FOAs (RFA/PA/PAR), notices (NOT-), budgets, DMS…&amp;#10;e.g., ‘For RFA-DA-27-004, are clinical trials allowed and what are the due dates?’"&gt;&lt;/textarea&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">          </span>&lt;div&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">            </span>&lt;button id="send"&gt;Ask&lt;/button&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">            </span>&lt;span class="loader" id="loader"&gt;&lt;/span&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">          </span>&lt;/div&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>&lt;/form&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>&lt;div class="hint"&gt;Tip: include an FOA number like &lt;span class="inline-code"&gt;RFA-DA-27-004&lt;/span&gt; to target that notice.&lt;/div&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>&lt;/div&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>&lt;/div&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">  </span>&lt;/div&gt;</span></p>
+<p class="p2"><span class="s1"></span><br></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">  </span>&lt;script&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>const chatEl<span class="Apple-converted-space">  </span>= document.getElementById('chat');</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>const form<span class="Apple-converted-space">    </span>= document.getElementById('ask-form');</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>const qEl <span class="Apple-converted-space">    </span>= document.getElementById('q');</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>const sendBtn = document.getElementById('send');</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>const loader<span class="Apple-converted-space">  </span>= document.getElementById('loader');</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>const foaQ<span class="Apple-converted-space">    </span>= document.getElementById('foa-q');</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>const foaList = document.getElementById('foa-list');</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>const foaMeta = document.getElementById('foa-meta');</span></p>
+<p class="p2"><span class="s1"></span><br></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>const FOA_RE = /\b(RFA|PA|PAR)-[A-Z]{2,}-\d{2}-\d{3}[A-Z]?\b/i;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>const NOT_RE = /\bNOT-[A-Z]{2,}-\d{2}-\d{3}\b/i;</span></p>
+<p class="p2"><span class="s1"></span><br></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>function addMsg(text, who='bot', sources=[]) {</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>const wrap = document.createElement('div');</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>wrap.className = 'card';</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>const msg = document.createElement('div');</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>msg.className = 'msg ' + who;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>msg.innerHTML = linkifyCitations(escapeHtml(text), sources);</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>wrap.appendChild(msg);</span></p>
+<p class="p2"><span class="s1"></span><br></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>if (who === 'bot' &amp;&amp; sources &amp;&amp; sources.length) {</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>const src = document.createElement('div');</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>src.className = 'sources';</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>const list = sources.map((s, i) =&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">          </span>`&lt;span&gt;[${i+1}] &lt;a href="${s.url}" target="_blank" rel="noopener"&gt;${escapeHtml(s.title || s.url)}&lt;/a&gt;&lt;/span&gt;`</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>).join(' • ');</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>src.innerHTML = `&lt;strong&gt;Sources:&lt;/strong&gt; ${list}`;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>wrap.appendChild(src);</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>}</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>chatEl.appendChild(wrap);</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>}</span></p>
+<p class="p2"><span class="s1"></span><br></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>function escapeHtml(s=''){</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>return s.replace(/[&amp;&lt;&gt;"']/g, m =&gt; ({'&amp;':'&amp;amp;','&lt;':'&amp;lt;','&gt;':'&amp;gt;','"':'&amp;quot;',"'":'&amp;#39;'}[m]));</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>}</span></p>
+<p class="p2"><span class="s1"></span><br></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>// Turn [1], [2] into clickable superscripts that point to sources</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>function linkifyCitations(text, sources){</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>if(!sources || !sources.length) return text;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>return text.replace(/\[(\d+)\]/g, (m, n)=&gt;{</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>const idx = parseInt(n,10)-1;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>const s = sources[idx];</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>if(!s) return m;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>return `&lt;sup&gt;&lt;a href="${s.url}" target="_blank" rel="noopener"&gt;[${n}]&lt;/a&gt;&lt;/sup&gt;`;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>});</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>}</span></p>
+<p class="p2"><span class="s1"></span><br></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>function setLoading(on){</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>sendBtn.disabled = on;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>loader.className = on ? 'loader on' : 'loader';</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>}</span></p>
+<p class="p2"><span class="s1"></span><br></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>async function fetchFOAMeta(number){</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>try{</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>const r = await fetch(`/foa/${encodeURIComponent(number)}`);</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>if(!r.ok) return null;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>return await r.json();</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>}catch{ return null; }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>}</span></p>
+<p class="p2"><span class="s1"></span><br></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>function renderFOACard(meta){</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>if(!meta) { foaMeta.innerHTML=''; return; }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>const kd = meta.key_dates || {};</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>const chips = (meta.activity_codes || []).map(x=&gt;`&lt;span class="chip"&gt;${escapeHtml(x)}&lt;/span&gt;`).join(' ');</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>const chips2 = (meta.participating_ics || []).map(x=&gt;`&lt;span class="chip"&gt;${escapeHtml(x)}&lt;/span&gt;`).join(' ');</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>foaMeta.innerHTML = `</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>&lt;div class="foa-card card"&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">          </span>&lt;div class="pill"&gt;&lt;strong&gt;${escapeHtml(meta.foa_number || '')}&lt;/strong&gt;&lt;span class="muted"&gt;FOA metadata&lt;/span&gt;&lt;/div&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">          </span>&lt;div style="margin-top:8px;"&gt;&lt;a href="${meta.url}" target="_blank" rel="noopener"&gt;${escapeHtml(meta.title || meta.url)}&lt;/a&gt;&lt;/div&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">          </span>&lt;div class="row2"&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">            </span>&lt;div&gt;&lt;strong&gt;Clinical Trial:&lt;/strong&gt; ${escapeHtml(meta.clinical_trial || '—')}&lt;/div&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">            </span>&lt;div&gt;&lt;strong&gt;Expiration:&lt;/strong&gt; ${escapeHtml(kd.expiration || '—')}&lt;/div&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">            </span>&lt;div&gt;&lt;strong&gt;Open Date:&lt;/strong&gt; ${escapeHtml(kd.open_date || '—')}&lt;/div&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">            </span>&lt;div&gt;&lt;strong&gt;LOI Due:&lt;/strong&gt; ${escapeHtml(kd.loi_due || '—')}&lt;/div&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">          </span>&lt;/div&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">          </span>&lt;div style="margin-top:8px;"&gt;&lt;strong&gt;Application Due Date(s):&lt;/strong&gt; ${escapeHtml(kd.due_dates || '—')}&lt;/div&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">          </span>&lt;div class="chips" style="margin-top:8px"&gt;${chips || ''}&lt;/div&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">          </span>&lt;div class="chips"&gt;${chips2 || ''}&lt;/div&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>&lt;/div&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>`;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>}</span></p>
+<p class="p2"><span class="s1"></span><br></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>form.addEventListener('submit', async (e) =&gt; {</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>e.preventDefault();</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>const question = qEl.value.trim();</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>if (!question) return;</span></p>
+<p class="p2"><span class="s1"></span><br></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>addMsg(question, 'user');</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>qEl.value = '';</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>setLoading(true);</span></p>
+<p class="p2"><span class="s1"></span><br></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>// If an FOA is mentioned, fetch its metadata and show a card</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>const m = question.match(FOA_RE) || question.match(NOT_RE);</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>if (m){</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>const meta = await fetchFOAMeta(m[0].toUpperCase());</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>renderFOACard(meta);</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>} else {</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>renderFOACard(null);</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>}</span></p>
+<p class="p2"><span class="s1"></span><br></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>try {</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>const resp = await fetch('/ask_rag', {</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">          </span>method: 'POST',</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">          </span>headers: { 'Content-Type': 'application/json' },</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">          </span>body: JSON.stringify({ question })</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>});</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>if (!resp.ok) {</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">          </span>const t = await resp.text();</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">          </span>addMsg(`Error: ${resp.status} ${escapeHtml(t.substring(0,200))}`, 'bot');</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>} else {</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">          </span>const data = await resp.json();</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">          </span>addMsg(data.answer, 'bot', data.sources || []);</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>}</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>} catch (err) {</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>addMsg('Network error: ' + escapeHtml(err?.message || String(err)), 'bot');</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>} finally {</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>setLoading(false);</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>}</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>});</span></p>
+<p class="p2"><span class="s1"></span><br></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>// FOA quick search</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>let foaTimer = null;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>foaQ.addEventListener('input', ()=&gt;{</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>clearTimeout(foaTimer);</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>const q = foaQ.value.trim();</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>if(!q){ foaList.innerHTML=''; return; }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>foaTimer = setTimeout(async ()=&gt;{</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>try{</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">          </span>const r = await fetch('/foa/search?q=' + encodeURIComponent(q));</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">          </span>const arr = await r.json();</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">          </span>foaList.innerHTML = arr.map(x =&gt; `</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">            </span>&lt;div class="item" data-num="${escapeHtml(x.foa_number)}" title="${escapeHtml(x.title || '')}"&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">              </span>&lt;div&gt;&lt;strong&gt;${escapeHtml(x.foa_number || '')}&lt;/strong&gt; &lt;span class="muted"&gt;${escapeHtml(x.foa_type || '')}&lt;/span&gt;&lt;/div&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">              </span>&lt;div class="muted" style="font-size:13px"&gt;${escapeHtml(x.title || '')}&lt;/div&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">            </span>&lt;/div&gt;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">          </span>`).join('');</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">          </span>[...foaList.querySelectorAll('.item')].forEach(div=&gt;{</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">            </span>div.addEventListener('click', async ()=&gt;{</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">              </span>const num = div.getAttribute('data-num');</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">              </span>// insert FOA number into the prompt (cursor-friendly)</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">              </span>const base = qEl.value.trim();</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">              </span>qEl.value = base ? `${base} (${num})` : num;</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">              </span>qEl.focus();</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">              </span>const meta = await fetchFOAMeta(num);</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">              </span>renderFOACard(meta);</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">            </span>});</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">          </span>});</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>}catch(e){ /* ignore */ }</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>}, 200);</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>});</span></p>
+<p class="p2"><span class="s1"></span><br></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>// Starter question buttons</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>document.querySelectorAll('.suggest button').forEach(btn=&gt;{</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>btn.addEventListener('click', ()=&gt;{</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>qEl.value = btn.getAttribute('data-q');</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">        </span>qEl.focus();</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">      </span>});</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>});</span></p>
+<p class="p2"><span class="s1"></span><br></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>// Greeting</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">    </span>addMsg('Hi! I can answer questions about NIH grants and specific FOAs/Notices. Include an FOA number (e.g., RFA-DA-27-004) to tailor the answer to that opportunity.');</span></p>
+<p class="p1"><span class="s1"><span class="Apple-converted-space">  </span>&lt;/script&gt;</span></p>
+<p class="p1"><span class="s1">&lt;/body&gt;</span></p>
+<p class="p1"><span class="s1">&lt;/html&gt;</span></p>
+</body>
+</html>

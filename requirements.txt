@@ -1,0 +1,12 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+sqlalchemy==2.0.35
+psycopg[binary]==3.2.3
+pgvector==0.2.5
+python-dotenv==1.0.1
+openai==1.51.0
+requests==2.32.3
+beautifulsoup4==4.12.3
+lxml==5.3.0
+pdfminer.six==20240706
+tiktoken==0.7.0

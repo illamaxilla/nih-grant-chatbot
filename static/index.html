@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>NIH Grants Chatbot</title>
+  <style>
+    :root { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; color-scheme: dark; }
+    body { margin: 0; background: #0b1020; color: #e8ecf1; }
+    header { padding: 16px 20px; border-bottom: 1px solid #1e2438; background: #0f1630; position: sticky; top: 0; z-index: 10; }
+    h1 { margin: 0; font-size: 18px; font-weight: 600; letter-spacing:.2px; }
+    .container { max-width: 1100px; margin: 0 auto; padding: 20px; display: grid; grid-template-columns: 320px 1fr; gap: 16px; }
+    .card { background: #121a3a; border: 1px solid #1e274d; border-radius: 12px; padding: 16px; }
+    .chat { display: flex; flex-direction: column; gap: 12px; }
+    .msg { padding: 12px 14px; border-radius: 12px; line-height: 1.6; white-space: pre-wrap; }
+    .msg.user { align-self: flex-end; background: #2b3a80; }
+    .msg.bot  { align-self: flex-start; background: #151f45; }
+    .sources { margin-top: 10px; font-size: 14px; opacity: 0.95; }
+    .sources a { color: #9ecbff; text-decoration: none; }
+    .sources a:hover { text-decoration: underline; }
+    .row { display: grid; grid-template-columns: 1fr auto; gap: 10px; }
+    textarea { width: 100%; min-height: 90px; resize: vertical; padding: 12px; background: #0e1533; color: #e8ecf1; border: 1px solid #233064; border-radius: 10px; }
+    button { padding: 10px 16px; border-radius: 10px; border: 1px solid #2e3c78; background: #243373; color: #e8ecf1; cursor: pointer; font-weight: 600; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .hint { color: #c9d6f0; opacity: .8; font-size: 13px; }
+    .pill { display: inline-flex; align-items: center; gap: 8px; padding: 8px 10px; background:#0f1a49; border:1px solid #2a3c8a; border-radius: 999px; font-size: 13px; }
+    .muted { opacity:.8 }
+    .list { display: flex; flex-direction: column; gap: 8px; max-height: 280px; overflow: auto; }
+    .item { padding: 10px; border-radius: 10px; border:1px solid #1e274d; background:#0f1636; cursor: pointer; }
+    .item:hover { background:#17215a; }
+    .inline-code { font-family: ui-monospace,SFMono-Regular,Menlo,monospace; background:#0e1533; padding: 1px 6px; border-radius:6px; border:1px solid #233064; }
+    .loader { display:none; margin-left:10px; }
+    .loader.on { display:inline-block; animation: spin 1s linear infinite; border:3px solid #3d4b89; border-top-color:#9ecbff; border-radius:50%; width:16px; height:16px; vertical-align: middle; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .foa-card { margin-top: 8px; padding: 12px; border-radius: 10px; background:#0f193f; border:1px solid #233064; font-size:14px; }
+    .foa-card .row2 { display:grid; grid-template-columns: repeat(2,1fr); gap:8px; margin-top:8px; }
+    .chips { display:flex; gap:6px; flex-wrap: wrap; margin-top:6px; }
+    .chip { padding:3px 8px; border-radius:999px; background:#18225a; border:1px solid #2b3a80; font-size:12px; }
+    .suggest { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+    .suggest button { background:#18225a; border-color:#2b3a80; font-weight:500; }
+    @media (max-width: 1000px){ .container { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <header><h1>NIH Grants Chatbot</h1></header>
+
+  <div class="container">
+    <!-- LEFT PANE: FOA Quick Search -->
+    <div class="card">
+      <h3 style="margin:0 0 10px 0;">Quick FOA Search</h3>
+      <input id="foa-q" placeholder="Type RFA-, PAR-, PA-, NOT-..." style="width:100%;padding:10px;border-radius:8px;border:1px solid #243373;background:#0e1533;color:#e8ecf1"/>
+      <div id="foa-list" class="list" style="margin-top:10px;"></div>
+      <div class="hint" style="margin-top:10px">
+        Click a result to insert the FOA number into your question.
+      </div>
+
+      <div style="height:16px"></div>
+      <h3 style="margin:0 0 10px 0;">Starter Questions</h3>
+      <div class="suggest">
+        <button data-q="What is the page limit for the Specific Aims section?">Specific Aims page limit</button>
+        <button data-q="What are the required elements of an NIH DMS Plan?">DMS Plan requirements</button>
+        <button data-q="For RFA-DA-27-004, what are the application due dates and are clinical trials allowed?">Due dates + CT for RFA</button>
+        <button data-q="What goes in the Modular Budget vs R&R Budget forms?">Modular vs R&R Budget</button>
+        <button data-q="Which human subjects and clinical trial forms are required?">Human Subjects/CT forms</button>
+      </div>
+    </div>
+
+    <!-- RIGHT PANE: Chat -->
+    <div>
+      <div id="foa-meta"></div>
+      <div id="chat" class="chat"></div>
+
+      <div class="card" style="margin-top:14px;">
+        <form id="ask-form" class="row">
+          <textarea id="q" placeholder="Ask about NIH Application Guide, FOAs (RFA/PA/PAR), notices (NOT-), budgets, DMS…&#10;e.g., ‘For RFA-DA-27-004, are clinical trials allowed and what are the due dates?’"></textarea>
+          <div>
+            <button id="send">Ask</button>
+            <span class="loader" id="loader"></span>
+          </div>
+        </form>
+        <div class="hint">Tip: include an FOA number like <span class="inline-code">RFA-DA-27-004</span> to target that notice.</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const chatEl  = document.getElementById('chat');
+    const form    = document.getElementById('ask-form');
+    const qEl     = document.getElementById('q');
+    const sendBtn = document.getElementById('send');
+    const loader  = document.getElementById('loader');
+    const foaQ    = document.getElementById('foa-q');
+    const foaList = document.getElementById('foa-list');
+    const foaMeta = document.getElementById('foa-meta');
+
+    const FOA_RE = /\b(RFA|PA|PAR)-[A-Z]{2,}-\d{2}-\d{3}[A-Z]?\b/i;
+    const NOT_RE = /\bNOT-[A-Z]{2,}-\d{2}-\d{3}\b/i;
+
+    function addMsg(text, who='bot', sources=[]) {
+      const wrap = document.createElement('div');
+      wrap.className = 'card';
+      const msg = document.createElement('div');
+      msg.className = 'msg ' + who;
+      msg.innerHTML = linkifyCitations(escapeHtml(text), sources);
+      wrap.appendChild(msg);
+
+      if (who === 'bot' && sources && sources.length) {
+        const src = document.createElement('div');
+        src.className = 'sources';
+        const list = sources.map((s, i) =>
+          `<span>[${i+1}] <a href="${s.url}" target="_blank" rel="noopener">${escapeHtml(s.title || s.url)}</a></span>`
+        ).join(' • ');
+        src.innerHTML = `<strong>Sources:</strong> ${list}`;
+        wrap.appendChild(src);
+      }
+      chatEl.appendChild(wrap);
+      window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+    }
+
+    function escapeHtml(s=''){
+      return s.replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+    }
+
+    // Turn [1], [2] into clickable superscripts that point to sources
+    function linkifyCitations(text, sources){
+      if(!sources || !sources.length) return text;
+      return text.replace(/\[(\d+)\]/g, (m, n)=>{
+        const idx = parseInt(n,10)-1;
+        const s = sources[idx];
+        if(!s) return m;
+        return `<sup><a href="${s.url}" target="_blank" rel="noopener">[${n}]</a></sup>`;
+      });
+    }
+
+    function setLoading(on){
+      sendBtn.disabled = on;
+      loader.className = on ? 'loader on' : 'loader';
+    }
+
+    async function fetchFOAMeta(number){
+      try{
+        const r = await fetch(`/foa/${encodeURIComponent(number)}`);
+        if(!r.ok) return null;
+        return await r.json();
+      }catch{ return null; }
+    }
+
+    function renderFOACard(meta){
+      if(!meta) { foaMeta.innerHTML=''; return; }
+      const kd = meta.key_dates || {};
+      const chips = (meta.activity_codes || []).map(x=>`<span class="chip">${escapeHtml(x)}</span>`).join(' ');
+      const chips2 = (meta.participating_ics || []).map(x=>`<span class="chip">${escapeHtml(x)}</span>`).join(' ');
+      foaMeta.innerHTML = `
+        <div class="foa-card card">
+          <div class="pill"><strong>${escapeHtml(meta.foa_number || '')}</strong><span class="muted">FOA metadata</span></div>
+          <div style="margin-top:8px;"><a href="${meta.url}" target="_blank" rel="noopener">${escapeHtml(meta.title || meta.url)}</a></div>
+          <div class="row2">
+            <div><strong>Clinical Trial:</strong> ${escapeHtml(meta.clinical_trial || '—')}</div>
+            <div><strong>Expiration:</strong> ${escapeHtml(kd.expiration || '—')}</div>
+            <div><strong>Open Date:</strong> ${escapeHtml(kd.open_date || '—')}</div>
+            <div><strong>LOI Due:</strong> ${escapeHtml(kd.loi_due || '—')}</div>
+          </div>
+          <div style="margin-top:8px;"><strong>Application Due Date(s):</strong> ${escapeHtml(kd.due_dates || '—')}</div>
+          <div class="chips" style="margin-top:8px">${chips || ''}</div>
+          <div class="chips">${chips2 || ''}</div>
+        </div>
+      `;
+    }
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const question = qEl.value.trim();
+      if (!question) return;
+
+      addMsg(question, 'user');
+      qEl.value = '';
+      setLoading(true);
+
+      // If an FOA is mentioned, fetch its metadata and show a card
+      const m = question.match(FOA_RE) || question.match(NOT_RE);
+      if (m){
+        const meta = await fetchFOAMeta(m[0].toUpperCase());
+        renderFOACard(meta);
+      } else {
+        renderFOACard(null);
+      }
+
+      try {
+        const resp = await fetch('/ask_rag', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ question })
+        });
+        if (!resp.ok) {
+          const t = await resp.text();
+          addMsg(`Error: ${resp.status} ${escapeHtml(t.substring(0,200))}`, 'bot');
+        } else {
+          const data = await resp.json();
+          addMsg(data.answer, 'bot', data.sources || []);
+        }
+      } catch (err) {
+        addMsg('Network error: ' + escapeHtml(err?.message || String(err)), 'bot');
+      } finally {
+        setLoading(false);
+      }
+    });
+
+    // FOA quick search
+    let foaTimer = null;
+    foaQ.addEventListener('input', ()=>{
+      clearTimeout(foaTimer);
+      const q = foaQ.value.trim();
+      if(!q){ foaList.innerHTML=''; return; }
+      foaTimer = setTimeout(async ()=>{
+        try{
+          const r = await fetch('/foa/search?q=' + encodeURIComponent(q));
+          const arr = await r.json();
+          foaList.innerHTML = arr.map(x => `
+            <div class="item" data-num="${escapeHtml(x.foa_number)}" title="${escapeHtml(x.title || '')}">
+              <div><strong>${escapeHtml(x.foa_number || '')}</strong> <span class="muted">${escapeHtml(x.foa_type || '')}</span></div>
+              <div class="muted" style="font-size:13px">${escapeHtml(x.title || '')}</div>
+            </div>
+          `).join('');
+          [...foaList.querySelectorAll('.item')].forEach(div=>{
+            div.addEventListener('click', async ()=>{
+              const num = div.getAttribute('data-num');
+              // insert FOA number into the prompt (cursor-friendly)
+              const base = qEl.value.trim();
+              qEl.value = base ? `${base} (${num})` : num;
+              qEl.focus();
+              const meta = await fetchFOAMeta(num);
+              renderFOACard(meta);
+            });
+          });
+        }catch(e){ /* ignore */ }
+      }, 200);
+    });
+
+    // Starter question buttons
+    document.querySelectorAll('.suggest button').forEach(btn=>{
+      btn.addEventListener('click', ()=>{
+        qEl.value = btn.getAttribute('data-q');
+        qEl.focus();
+      });
+    });
+
+    // Greeting
+    addMsg('Hi! I can answer questions about NIH grants and specific FOAs/Notices. Include an FOA number (e.g., RFA-DA-27-004) to tailor the answer to that opportunity.');
+  </script>
+</body>
+</html>
