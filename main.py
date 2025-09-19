@@ -12,9 +12,6 @@ from sqlalchemy import text
 from pgvector.psycopg import register_vector  # <— no Vector import
 import os, time, random, re, json, math, datetime
 
-# import the ingester so we can refresh URLs/FOAs on demand
-from ingest_basic import ingest_url
-
 load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or ""
@@ -375,7 +372,10 @@ class RefreshResponse(BaseModel):
 
 @app.post("/admin/refresh_foa/{foa_number}", response_model=RefreshResponse, dependencies=[Depends(require_admin)])
 def refresh_foa(foa_number: str):
+    # lazy import so the app can start even if optional deps aren’t present
+    from ingest_basic import ingest_url  # <-- moved inside
     tried = []
+    last_err = None
     for url in guess_foa_url(foa_number):
         tried.append(url)
         try:
@@ -384,10 +384,12 @@ def refresh_foa(foa_number: str):
         except Exception as e:
             last_err = str(e)
             continue
-    return RefreshResponse(ok=False, tried=tried, message=f"Could not ingest any candidate URL. Last error: {last_err if 'last_err' in locals() else 'n/a'}")
+    return RefreshResponse(ok=False, tried=tried, message=f"Could not ingest any candidate URL. Last error: {last_err or 'n/a'}")
 
 @app.post("/admin/reindex_url", response_model=RefreshResponse, dependencies=[Depends(require_admin)])
 def reindex_url(url: str = Query(..., description="Absolute HTTP(S) URL to ingest or refresh")):
+    # lazy import so the app can start even if optional deps aren’t present
+    from ingest_basic import ingest_url  # <-- moved inside
     try:
         ingest_url(url, visited=set())
         return RefreshResponse(ok=True, tried=[url], message="URL ingested/refreshed.")
