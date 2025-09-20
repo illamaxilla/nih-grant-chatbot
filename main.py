@@ -25,6 +25,9 @@ def _normalize_db_url(url: str) -> str:
     # Ensure SQLAlchemy uses psycopg v3 driver (NOT psycopg2)
     if url.startswith("postgresql://") and "+psycopg" not in url and "+psycopg2" not in url:
         url = url.replace("postgresql://", "postgresql+psycopg://", 1)
+    # Add a sane connect timeout if not present (helps Render health checks)
+    if "connect_timeout=" not in url:
+        url += ("&" if "?" in url else "?") + "connect_timeout=10"
     return url
 
 DATABASE_URL = _normalize_db_url(RAW_DATABASE_URL)
@@ -35,20 +38,14 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL missing")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
-engine = sa.create_engine(DATABASE_URL, future=True)
 
-# -------- DeBug --------
-from sqlalchemy import text as _sa_text
-
-@app.get("/_debug/db")
-def _debug_db():
-    try:
-        with engine.connect() as conn:
-            v = conn.execute(_sa_text("select version();")).scalar_one()
-        return {"ok": True, "version": v}
-    except Exception as e:
-        # Return full exception so we can see the real reason
-        return {"ok": False, "error": repr(e)}
+# Safer pool settings for serverless-ish envs
+engine = sa.create_engine(
+    DATABASE_URL,
+    future=True,
+    pool_pre_ping=True,   # validates connections before use
+    pool_recycle=300,     # recycle to avoid long-idle drops
+)
 
 # -------- Admin API key auth --------
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
@@ -93,6 +90,17 @@ def health():
         db_ok = False
         msg = f"db_error: {e.__class__.__name__}"
     return {"ok": ok, "db_ok": db_ok, "message": msg}
+
+# --- Debug endpoint (AFTER app is created) ---
+@app.get("/_debug/db")
+def _debug_db():
+    try:
+        with engine.connect() as conn:
+            v = conn.execute(text("select version();")).scalar_one()
+        return {"ok": True, "version": v}
+    except Exception as e:
+        # Return full exception so we can see the real reason
+        return {"ok": False, "error": repr(e)}
 
 @app.get("/models")
 def list_models():
@@ -207,7 +215,7 @@ def _cosine(a, b):
 def mmr_rerank(q_vec, cand_vecs, k=6, lambda_mult=0.7):
     if not cand_vecs: return []
     selected, remaining = [], list(range(len(cand_vecs)))
-    rel = [ _cosine(q_vec, v) for v in cand_vecs ]
+    rel = [_cosine(q_vec, v) for v in cand_vecs]
     while remaining and len(selected) < k:
         if not selected:
             i = max(remaining, key=lambda idx: rel[idx])
@@ -244,7 +252,7 @@ def retrieve_top_chunks(query: str, k: int = 6, foa_hint: str = None):
                     {where_extra}
                     ORDER BY e.embedding <-> :qe
                     LIMIT :n
-                """), {"qe": qe, "n": topN, **params}).fetchall()  # pass list directly
+                """), {"qe": qe, "n": topN, **params}).fetchall()
                 return [{"content": r.content, "title": r.title, "url": r.url, "emb": _to_list(r.emb)} for r in rows]
 
             # 1) FOA-focused
