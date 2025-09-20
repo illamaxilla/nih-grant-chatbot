@@ -6,6 +6,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from dotenv import load_dotenv
 from openai import OpenAI
 from pydantic import BaseModel
+import socket
 import sqlalchemy as sa
 import sqlalchemy.exc as sa_exc
 from sqlalchemy import text
@@ -43,8 +44,9 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 engine = sa.create_engine(
     DATABASE_URL,
     future=True,
-    pool_pre_ping=True,   # validates connections before use
-    pool_recycle=300,     # recycle to avoid long-idle drops
+    pool_pre_ping=True,
+    pool_recycle=300,
+    connect_args={"gai_family": socket.AF_INET},  # force IPv4
 )
 
 # -------- Admin API key auth --------
