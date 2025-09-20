@@ -6,11 +6,11 @@ from fastapi.responses import FileResponse, HTMLResponse
 from dotenv import load_dotenv
 from openai import OpenAI
 from pydantic import BaseModel
-import socket
 import sqlalchemy as sa
 import sqlalchemy.exc as sa_exc
 from sqlalchemy import text
 from pgvector.psycopg import register_vector  # psycopg v3 adapter
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 import os, time, random, re, json, math, datetime
 
 load_dotenv()
@@ -20,18 +20,34 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or ""
 RAW_DATABASE_URL = os.getenv("DATABASE_URL") or ""
 
 def _normalize_db_url(url: str) -> str:
+    if not url:
+        return url
     # Convert older "postgres://" to "postgresql://"
     if url.startswith("postgres://"):
         url = "postgresql://" + url[len("postgres://"):]
     # Ensure SQLAlchemy uses psycopg v3 driver (NOT psycopg2)
     if url.startswith("postgresql://") and "+psycopg" not in url and "+psycopg2" not in url:
         url = url.replace("postgresql://", "postgresql+psycopg://", 1)
-    # Add a sane connect timeout if not present (helps Render health checks)
-    if "connect_timeout=" not in url:
-        url += ("&" if "?" in url else "?") + "connect_timeout=10"
     return url
 
-DATABASE_URL = _normalize_db_url(RAW_DATABASE_URL)
+def _strip_bad_params(url: str) -> str:
+    """
+    Removes parameters that libpq/psycopg don't understand (e.g., gai_family).
+    Keeps everything else intact.
+    """
+    try:
+        p = urlparse(url)
+        qs = dict(parse_qsl(p.query, keep_blank_values=True))
+        # Drop any variant casing just in case
+        for bad in list(qs.keys()):
+            if bad.lower() == "gai_family":
+                qs.pop(bad, None)
+        new_q = urlencode(qs, doseq=True)
+        return urlunparse((p.scheme, p.netloc, p.path, p.params, new_q, p.fragment))
+    except Exception:
+        return url  # if parsing fails, just return original
+
+DATABASE_URL = _strip_bad_params(_normalize_db_url(RAW_DATABASE_URL))
 
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY missing")
@@ -39,28 +55,7 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL missing")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
-
-# Safer pool settings for serverless-ish envs
-engine = sa.create_engine(
-    DATABASE_URL,
-    future=True,
-    pool_pre_ping=True,
-    pool_recycle=300,
-    connect_args={"gai_family": socket.AF_INET},  # force IPv4
-)
-
-# -------- Admin API key auth --------
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
-
-def require_admin(x_api_key: str = Header(None)):
-    """
-    If ADMIN_API_KEY is set, require header:
-      x-api-key: <ADMIN_API_KEY>
-    """
-    if not ADMIN_API_KEY:
-        return  # auth disabled if not set
-    if x_api_key != ADMIN_API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+engine = sa.create_engine(DATABASE_URL, future=True)
 
 # -------- App & Static --------
 app = FastAPI(title="NIH Grants Chatbot (MVP)")
@@ -78,9 +73,44 @@ app.mount("/app", StaticFiles(directory="static", html=True), name="static")
 def root_index():
     return FileResponse("static/index.html")
 
+# -------- Debug helpers (safe, redacted) --------
+def _redact_url(u: str) -> str:
+    try:
+        p = urlparse(u)
+        netloc = p.netloc
+        if "@" in netloc:
+            creds, host = netloc.split("@", 1)
+            if ":" in creds:
+                user, _ = creds.split(":", 1)
+                netloc = f"{user}:***@{host}"
+            else:
+                netloc = f"{creds}:***@{host}"
+        return urlunparse((p.scheme, netloc, p.path, p.params, p.query, p.fragment))
+    except Exception:
+        return "***"
+
+from sqlalchemy import text as _sa_text
+
+@app.get("/_debug/env")
+def _debug_env():
+    raw = os.getenv("DATABASE_URL", "")
+    return {
+        "raw": _redact_url(raw),
+        "normalized": _redact_url(_normalize_db_url(raw)),
+        "effective": _redact_url(DATABASE_URL),
+    }
+
+@app.get("/_debug/db")
+def _debug_db():
+    try:
+        with engine.connect() as conn:
+            v = conn.execute(_sa_text("select version();")).scalar_one()
+        return {"ok": True, "version": v}
+    except Exception as e:
+        return {"ok": False, "error": repr(e)}
+
 @app.get("/health")
 def health():
-    # Light DB ping; if it fails, we still return ok=False but 200 to avoid platform healthcheck loops
     ok = True
     db_ok = True
     msg = "ok"
@@ -93,16 +123,14 @@ def health():
         msg = f"db_error: {e.__class__.__name__}"
     return {"ok": ok, "db_ok": db_ok, "message": msg}
 
-# --- Debug endpoint (AFTER app is created) ---
-@app.get("/_debug/db")
-def _debug_db():
-    try:
-        with engine.connect() as conn:
-            v = conn.execute(text("select version();")).scalar_one()
-        return {"ok": True, "version": v}
-    except Exception as e:
-        # Return full exception so we can see the real reason
-        return {"ok": False, "error": repr(e)}
+# -------- Admin API key auth --------
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
+
+def require_admin(x_api_key: str = Header(None)):
+    if not ADMIN_API_KEY:
+        return  # auth disabled if not set
+    if x_api_key != ADMIN_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 @app.get("/models")
 def list_models():
@@ -217,7 +245,7 @@ def _cosine(a, b):
 def mmr_rerank(q_vec, cand_vecs, k=6, lambda_mult=0.7):
     if not cand_vecs: return []
     selected, remaining = [], list(range(len(cand_vecs)))
-    rel = [_cosine(q_vec, v) for v in cand_vecs]
+    rel = [ _cosine(q_vec, v) for v in cand_vecs ]
     while remaining and len(selected) < k:
         if not selected:
             i = max(remaining, key=lambda idx: rel[idx])
@@ -230,15 +258,8 @@ def mmr_rerank(q_vec, cand_vecs, k=6, lambda_mult=0.7):
     return selected
 
 def retrieve_top_chunks(query: str, k: int = 6, foa_hint: str = None):
-    """
-    1) Try FOA-constrained search (if hint present)
-    2) Else hybrid: FTS pre-filter + vector rank (if chunks.ts exists)
-    3) Else pure vector
-    Then MMR to diversify results.
-    """
     qe = embed_query(query)  # Python list
     topN = max(12, k * 4)
-
     try:
         with engine.begin() as conn:
             raw = conn.connection.driver_connection
@@ -257,7 +278,6 @@ def retrieve_top_chunks(query: str, k: int = 6, foa_hint: str = None):
                 """), {"qe": qe, "n": topN, **params}).fetchall()
                 return [{"content": r.content, "title": r.title, "url": r.url, "emb": _to_list(r.emb)} for r in rows]
 
-            # 1) FOA-focused
             if foa_hint:
                 like = f"%{foa_hint.upper()}%"
                 cands = candidates_sql("WHERE d.url ILIKE :like OR d.title ILIKE :like", {"like": like})
@@ -266,7 +286,6 @@ def retrieve_top_chunks(query: str, k: int = 6, foa_hint: str = None):
                     keep = mmr_rerank(qe, vecs, k=k, lambda_mult=0.7)
                     return [cands[i] for i in keep]
 
-            # 2) Hybrid FTS pre-filter (gracefully skip if chunks.ts doesn't exist)
             cands = []
             try:
                 cands = candidates_sql(
@@ -274,12 +293,10 @@ def retrieve_top_chunks(query: str, k: int = 6, foa_hint: str = None):
                     {"ftsq": query}
                 )
             except sa_exc.DBAPIError:
-                cands = []  # FTS not available; ignore and fall back
+                cands = []
 
             if not cands:
-                # 3) Pure vector fallback
                 cands = candidates_sql()
-
             if not cands:
                 return []
 
@@ -287,7 +304,6 @@ def retrieve_top_chunks(query: str, k: int = 6, foa_hint: str = None):
             keep = mmr_rerank(qe, vecs, k=k, lambda_mult=0.7)
             return [cands[i] for i in keep]
     except Exception:
-        # If anything DB-related blows up, return empty so caller can show a friendly message
         return []
 
 def build_context(cands):
@@ -433,13 +449,10 @@ class RefreshResponse(BaseModel):
 def refresh_foa(foa_number: str):
     tried = []
     last_err = None
-
-    # Safe import so failures don't 500 the whole request
     try:
         from ingest_basic import ingest_url  # lazy import
     except Exception as e:
         return RefreshResponse(ok=False, tried=[], message=f"ingest module not available: {e}")
-
     for url in guess_foa_url(foa_number):
         tried.append(url)
         try:
@@ -448,18 +461,14 @@ def refresh_foa(foa_number: str):
         except Exception as e:
             last_err = str(e)
             continue
-
     return RefreshResponse(ok=False, tried=tried, message=f"Could not ingest any candidate URL. Last error: {last_err or 'n/a'}")
 
 @app.post("/admin/reindex_url", response_model=RefreshResponse, dependencies=[Depends(require_admin)])
 def reindex_url(url: str = Query(..., description="Absolute HTTP(S) URL to ingest or refresh")):
-    # Safe import so failures don't 500 the whole request
     try:
         from ingest_basic import ingest_url  # lazy import
     except Exception as e:
         return RefreshResponse(ok=False, tried=[url], message=f"ingest module not available: {e}")
-
-    # Run ingest and capture any runtime error into the JSON response
     try:
         ingest_url(url, visited=set())
         return RefreshResponse(ok=True, tried=[url], message="URL ingested/refreshed.")
