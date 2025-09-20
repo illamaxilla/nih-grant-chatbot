@@ -37,6 +37,19 @@ if not DATABASE_URL:
 client = OpenAI(api_key=OPENAI_API_KEY)
 engine = sa.create_engine(DATABASE_URL, future=True)
 
+# -------- DeBug --------
+from sqlalchemy import text as _sa_text
+
+@app.get("/_debug/db")
+def _debug_db():
+    try:
+        with engine.connect() as conn:
+            v = conn.execute(_sa_text("select version();")).scalar_one()
+        return {"ok": True, "version": v}
+    except Exception as e:
+        # Return full exception so we can see the real reason
+        return {"ok": False, "error": repr(e)}
+
 # -------- Admin API key auth --------
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
 
