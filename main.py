@@ -438,3 +438,42 @@ def reindex_url(url: str = Query(..., description="Absolute HTTP(S) URL to inges
         return RefreshResponse(ok=True, tried=[url], message="URL ingested/refreshed.")
     except Exception as e:
         return RefreshResponse(ok=False, tried=[url], message=str(e))
+
+# ---------- DEBUG: quick doc/vec checks ----------
+from pgvector.psycopg import register_vector as _register_vector
+
+@app.get("/_debug/docs_by_like")
+def _debug_docs_by_like(q: str, limit: int = 10):
+    with engine.begin() as conn:
+        rows = conn.execute(text("""
+            SELECT id, title, url, fetched_at
+            FROM documents
+            WHERE title ILIKE :q OR url ILIKE :q
+            ORDER BY fetched_at DESC NULLS LAST
+            LIMIT :n
+        """), {"q": f"%{q}%", "n": limit}).fetchall()
+    return {
+        "ok": True,
+        "count": len(rows),
+        "docs": [{"id": r.id, "title": r.title, "url": r.url} for r in rows],
+    }
+
+@app.get("/_debug/search")
+def _debug_search(q: str, limit: int = 5):
+    try:
+        qe = client.embeddings.create(model="text-embedding-3-small", input=[q]).data[0].embedding
+        with engine.begin() as conn:
+            raw = conn.connection.driver_connection
+            _register_vector(raw)
+            rows = conn.execute(text("""
+                SELECT d.title, d.url
+                FROM embeddings e
+                JOIN chunks c ON c.id = e.chunk_id
+                JOIN documents d ON d.id = c.doc_id
+                ORDER BY e.embedding <-> :qe
+                LIMIT :n
+            """), {"qe": qe, "n": limit}).fetchall()
+        return {"ok": True, "count": len(rows),
+                "results": [{"title": r.title, "url": r.url} for r in rows]}
+    except Exception as e:
+        return {"ok": False, "error": repr(e)}
