@@ -9,18 +9,19 @@ from pydantic import BaseModel
 import sqlalchemy as sa
 import sqlalchemy.exc as sa_exc
 from sqlalchemy import text
-from pgvector.psycopg import register_vector
+from pgvector.psycopg import register_vector  # psycopg v3 adapter
 import os, time, random, re, json, math, datetime
 
+# ------------ Env & config ------------
 load_dotenv()
 
-# ---------- OpenAI & DB config ----------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or ""
 RAW_DATABASE_URL = os.getenv("DATABASE_URL") or ""
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
+# Toggle debug endpoints via environment: DEBUG=1 enables /_debug/* routes
+DEBUG = os.getenv("DEBUG", "0")
 
 def _normalize_db_url(url: str) -> str:
-    if not url:
-        return url
     # Convert older "postgres://" to "postgresql://"
     if url.startswith("postgres://"):
         url = "postgresql://" + url[len("postgres://"):]
@@ -36,16 +37,21 @@ if not OPENAI_API_KEY:
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL missing")
 
-# Psycopg v3 client & connection tweaks to avoid prepare / SASL issues on some hosts
-CONNECT_ARGS = {
-    "prepare_threshold": 0,
-    "channel_binding": "disable",
-}
-
 client = OpenAI(api_key=OPENAI_API_KEY)
-engine = sa.create_engine(DATABASE_URL, future=True, connect_args=CONNECT_ARGS)
+engine = sa.create_engine(DATABASE_URL, future=True)
 
-# ---------- App & middleware ----------
+# ------------ Auth helper for admin routes ------------
+def require_admin(x_api_key: str = Header(None)):
+    """
+    If ADMIN_API_KEY is set, require header:
+      x-api-key: <ADMIN_API_KEY>
+    """
+    if not ADMIN_API_KEY:
+        return  # auth disabled if not set
+    if x_api_key != ADMIN_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+# ------------ App & CORS ------------
 app = FastAPI(title="NIH Grants Chatbot (MVP)")
 app.add_middleware(
     CORSMiddleware,
@@ -61,23 +67,9 @@ app.mount("/app", StaticFiles(directory="static", html=True), name="static")
 def root_index():
     return FileResponse("static/index.html")
 
-# ---------- Admin API key auth ----------
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
-
-def require_admin(x_api_key: str = Header(None)):
-    """
-    If ADMIN_API_KEY is set, require header:
-      x-api-key: <ADMIN_API_KEY>
-    """
-    if not ADMIN_API_KEY:
-        return  # auth disabled if not set
-    if x_api_key != ADMIN_API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-# ---------- Health & models ----------
+# Health that lightly pings DB but always returns 200 (platform healthchecks)
 @app.get("/health")
 def health():
-    # Light DB ping; if it fails, return ok=False but 200 to avoid platform healthcheck loops
     ok = True
     db_ok = True
     msg = "ok"
@@ -90,6 +82,7 @@ def health():
         msg = f"db_error: {e.__class__.__name__}"
     return {"ok": ok, "db_ok": db_ok, "message": msg}
 
+# Models list (handy sanity check)
 @app.get("/models")
 def list_models():
     try:
@@ -98,7 +91,7 @@ def list_models():
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"OpenAI error: {type(e).__name__}")
 
-# ---------- Simple /ask (no RAG) ----------
+# ------------ Simple /ask (no RAG) ------------
 class AskRequest(BaseModel):
     question: str
 
@@ -127,7 +120,7 @@ def ask(req: AskRequest):
                 continue
             raise HTTPException(status_code=503, detail=f"LLM error: {type(e).__name__}")
 
-# ---------- FOA endpoints ----------
+# ------------ FOA endpoints ------------
 FOA_RE = re.compile(r"\b(RFA|PA|PAR)-[A-Z]{2,}-\d{2}-\d{3}[A-Z]?\b", re.IGNORECASE)
 NOTICE_RE = re.compile(r"\bNOT-[A-Z]{2,}-\d{2}-\d{3}\b", re.IGNORECASE)
 
@@ -181,7 +174,7 @@ def get_foa_meta(foa_number: str):
         "key_dates": kd,
     }
 
-# ---------- RAG helpers ----------
+# ------------ RAG helpers (Hybrid + MMR) ------------
 def embed_query(q: str):
     return client.embeddings.create(model="text-embedding-3-small", input=[q]).data[0].embedding
 
@@ -203,7 +196,7 @@ def _cosine(a, b):
 def mmr_rerank(q_vec, cand_vecs, k=6, lambda_mult=0.7):
     if not cand_vecs: return []
     selected, remaining = [], list(range(len(cand_vecs)))
-    rel = [_cosine(q_vec, v) for v in cand_vecs]
+    rel = [ _cosine(q_vec, v) for v in cand_vecs ]
     while remaining and len(selected) < k:
         if not selected:
             i = max(remaining, key=lambda idx: rel[idx])
@@ -217,24 +210,20 @@ def mmr_rerank(q_vec, cand_vecs, k=6, lambda_mult=0.7):
 
 def retrieve_top_chunks(query: str, k: int = 6, foa_hint: str = None):
     """
-    1) Heuristic boost for NIH "Standard Due Dates" content if query is due-date-like
-    2) FOA-constrained search (if hint present)
-    3) Hybrid: FTS pre-filter + vector rank (if chunks.ts exists)
-    4) Pure vector
+    1) Try FOA-constrained search (if hint present)
+    2) Else hybrid: FTS pre-filter + vector rank (if chunks.ts exists)
+    3) Else pure vector
     Then MMR to diversify results.
     """
     qe = embed_query(query)  # Python list
-    topN = max(16, k * 4)
-
-    due_like = any(p in query.lower() for p in ["due date", "due dates", "deadline", "deadlines"])
-    due_url_like = "%/due-dates%"
+    topN = max(12, k * 4)
 
     try:
         with engine.begin() as conn:
             raw = conn.connection.driver_connection
             register_vector(raw)  # enables list<->vector adaptation
 
-            def candidates_sql(where_extra: str = "", params: dict = None, limit: int = topN):
+            def candidates_sql(where_extra: str = "", params: dict = None):
                 params = params or {}
                 rows = conn.execute(text(f"""
                     SELECT c.content, d.title, d.url, e.embedding AS emb
@@ -242,24 +231,21 @@ def retrieve_top_chunks(query: str, k: int = 6, foa_hint: str = None):
                     JOIN chunks c ON c.id = e.chunk_id
                     JOIN documents d ON d.id = c.doc_id
                     {where_extra}
-                    ORDER BY e.embedding <-> CAST(:qe AS vector)
+                    ORDER BY e.embedding <-> :qe
                     LIMIT :n
-                """), {"qe": qe, "n": limit, **params}).fetchall()
+                """), {"qe": qe, "n": topN, **params}).fetchall()  # pass list directly
                 return [{"content": r.content, "title": r.title, "url": r.url, "emb": _to_list(r.emb)} for r in rows]
 
-            boosted = []
-            if due_like:
-                boosted = candidates_sql(
-                    "WHERE d.url ILIKE :u OR d.title ILIKE :t",
-                    {"u": due_url_like, "t": "%due date%"},
-                    limit=max(10, k * 2)
-                )
-
-            foa_cands = []
+            # 1) FOA-focused
             if foa_hint:
                 like = f"%{foa_hint.upper()}%"
-                foa_cands = candidates_sql("WHERE d.url ILIKE :like OR d.title ILIKE :like", {"like": like})
+                cands = candidates_sql("WHERE d.url ILIKE :like OR d.title ILIKE :like", {"like": like})
+                if cands:
+                    vecs = [c["emb"] for c in cands]
+                    keep = mmr_rerank(qe, vecs, k=k, lambda_mult=0.7)
+                    return [cands[i] for i in keep]
 
+            # 2) Hybrid FTS pre-filter (gracefully skip if chunks.ts doesn't exist)
             cands = []
             try:
                 cands = candidates_sql(
@@ -270,25 +256,15 @@ def retrieve_top_chunks(query: str, k: int = 6, foa_hint: str = None):
                 cands = []  # FTS not available; ignore and fall back
 
             if not cands:
+                # 3) Pure vector fallback
                 cands = candidates_sql()
 
-            # Merge and de-dupe by (title, url)
-            def key(x): return (x["title"], x["url"])
-            seen = set()
-            merged = []
-            for group in (boosted, foa_cands, cands):
-                for item in group:
-                    k2 = key(item)
-                    if k2 not in seen:
-                        merged.append(item)
-                        seen.add(k2)
-
-            if not merged:
+            if not cands:
                 return []
 
-            vecs = [c["emb"] for c in merged]
+            vecs = [c["emb"] for c in cands]
             keep = mmr_rerank(qe, vecs, k=k, lambda_mult=0.7)
-            return [merged[i] for i in keep]
+            return [cands[i] for i in keep]
     except Exception:
         # If anything DB-related blows up, return empty so caller can show a friendly message
         return []
@@ -363,7 +339,7 @@ def ask_rag(req: AskRequest):
                 continue
             raise HTTPException(status_code=503, detail=f"LLM error: {type(e).__name__}")
 
-# ---------- Admin: stats ----------
+# ------------ Admin: stats (protected) ------------
 @app.get("/admin/stats", dependencies=[Depends(require_admin)])
 def admin_stats():
     with engine.begin() as conn:
@@ -386,7 +362,7 @@ def admin_stats():
         "last_foa_seen": to_iso(last_foa),
     }
 
-# ---------- Admin: changes ----------
+# ------------ Admin: recent changes (protected) ------------
 @app.get("/admin/changes", dependencies=[Depends(require_admin)])
 def admin_changes(limit: int = 50):
     with engine.begin() as conn:
@@ -409,7 +385,7 @@ def admin_changes(limit: int = 50):
         })
     return out
 
-# ---------- Admin: on-demand ingest/refresh ----------
+# ------------ Admin: ingest/refresh (protected) ------------
 def guess_foa_url(foa_number: str):
     """Return likely NIH Guide URL(s) for a given FOA/Notice number."""
     n = foa_number.upper()
@@ -436,11 +412,11 @@ class RefreshResponse(BaseModel):
 def refresh_foa(foa_number: str):
     tried = []
     last_err = None
+    # Lazy import so app can start even if optional deps aren’t present
     try:
-        from ingest_basic import ingest_url  # lazy import
+        from ingest_basic import ingest_url
     except Exception as e:
         return RefreshResponse(ok=False, tried=[], message=f"ingest module not available: {e}")
-
     for url in guess_foa_url(foa_number):
         tried.append(url)
         try:
@@ -449,13 +425,13 @@ def refresh_foa(foa_number: str):
         except Exception as e:
             last_err = str(e)
             continue
-
     return RefreshResponse(ok=False, tried=tried, message=f"Could not ingest any candidate URL. Last error: {last_err or 'n/a'}")
 
 @app.post("/admin/reindex_url", response_model=RefreshResponse, dependencies=[Depends(require_admin)])
 def reindex_url(url: str = Query(..., description="Absolute HTTP(S) URL to ingest or refresh")):
+    # Lazy import so app can start even if optional deps aren’t present
     try:
-        from ingest_basic import ingest_url  # lazy import
+        from ingest_basic import ingest_url
     except Exception as e:
         return RefreshResponse(ok=False, tried=[url], message=f"ingest module not available: {e}")
     try:
@@ -464,57 +440,76 @@ def reindex_url(url: str = Query(..., description="Absolute HTTP(S) URL to inges
     except Exception as e:
         return RefreshResponse(ok=False, tried=[url], message=str(e))
 
-# ---------- Debug endpoints ----------
-@app.get("/_debug/env")
-def _debug_env():
-    return {
-        "raw": RAW_DATABASE_URL or "",
-        "normalized": _normalize_db_url(RAW_DATABASE_URL or "") or "",
-        "effective": DATABASE_URL or "",
-        "connect_args": CONNECT_ARGS,
-    }
+# ------------ Debug endpoints (guarded by DEBUG=1) ------------
+if DEBUG == "1":
+    from sqlalchemy import text as _sa_text
 
-@app.get("/_debug/db")
-def _debug_db():
-    try:
-        with engine.connect() as conn:
-            v = conn.execute(text("select version();")).scalar_one()
-        return {"ok": True, "version": v}
-    except Exception as e:
-        return {"ok": False, "error": repr(e)}
+    @app.get("/_debug/env")
+    def _debug_env():
+        # Show how DATABASE_URL is interpreted
+        raw = os.getenv("DATABASE_URL", "")
+        normalized = _normalize_db_url(raw)
+        effective = DATABASE_URL
+        # Example connect_args you might choose to use in some deployments
+        connect_args = {"prepare_threshold": 0, "channel_binding": "disable"}
+        return {
+            "raw": raw,
+            "normalized": normalized,
+            "effective": effective,
+            "connect_args": connect_args,
+        }
 
-@app.get("/_debug/docs_by_like")
-def _debug_docs_by_like(q: str, limit: int = 10):
-    try:
-        with engine.begin() as conn:
-            rows = conn.execute(text("""
-                SELECT id, title, url
-                FROM documents
-                WHERE title ILIKE :q OR url ILIKE :q
-                ORDER BY id DESC
-                LIMIT :n
-            """), {"q": f"%{q}%", "n": limit}).fetchall()
-        return {"ok": True, "count": len(rows),
-                "docs": [{"id": r.id, "title": r.title, "url": r.url} for r in rows]}
-    except Exception as e:
-        return {"ok": False, "error": repr(e)}
+    @app.get("/_debug/db")
+    def _debug_db():
+        try:
+            with engine.connect() as conn:
+                v = conn.execute(_sa_text("select version();")).scalar_one()
+            return {"ok": True, "version": v}
+        except Exception as e:
+            return {"ok": False, "error": repr(e)}
 
-@app.get("/_debug/search")
-def _debug_search(q: str, limit: int = 10):
-    try:
-        qe = embed_query(q)
+    @app.get("/_debug/search")
+    def _debug_search(q: str):
+        # Minimal vector search (no MMR, no FTS), useful for sanity checks.
+        qe = client.embeddings.create(
+            model="text-embedding-3-small",
+            input=[q]
+        ).data[0].embedding
         with engine.begin() as conn:
             raw = conn.connection.driver_connection
             register_vector(raw)
-            rows = conn.execute(text("""
-                SELECT d.id, d.title, d.url
-                FROM embeddings e
-                JOIN chunks c ON c.id = e.chunk_id
-                JOIN documents d ON d.id = c.doc_id
-                ORDER BY e.embedding <-> CAST(:qe AS vector)
-                LIMIT :n
-            """), {"qe": qe, "n": limit}).fetchall()
-        return {"ok": True, "count": len(rows),
-                "docs": [{"id": r.id, "title": r.title, "url": r.url} for r in rows]}
-    except Exception as e:
-        return {"ok": False, "error": repr(e)}
+            rows = conn.execute(
+                text("""
+                    SELECT d.id, d.title, d.url
+                    FROM embeddings e
+                    JOIN chunks c ON c.id = e.chunk_id
+                    JOIN documents d ON d.id = c.doc_id
+                    ORDER BY e.embedding <-> :qe
+                    LIMIT 10
+                """),
+                {"qe": qe},
+            ).fetchall()
+        return {
+            "ok": True,
+            "count": len(rows),
+            "docs": [{"id": r.id, "title": r.title, "url": r.url} for r in rows],
+        }
+
+    @app.get("/_debug/docs_by_like")
+    def _debug_docs_by_like(q: str):
+        with engine.begin() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT id, title, url
+                    FROM documents
+                    WHERE url ILIKE :q OR title ILIKE :q
+                    ORDER BY fetched_at DESC
+                    LIMIT 10
+                """),
+                {"q": f"%{q}%"},
+            ).fetchall()
+        return {
+            "ok": True,
+            "count": len(rows),
+            "docs": [{"id": r.id, "title": r.title, "url": r.url} for r in rows],
+        }
