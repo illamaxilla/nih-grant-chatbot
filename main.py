@@ -10,44 +10,33 @@ import sqlalchemy as sa
 import sqlalchemy.exc as sa_exc
 from sqlalchemy import text
 from pgvector.psycopg import register_vector  # psycopg v3 adapter
-from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 import os, time, random, re, json, math, datetime
 
 load_dotenv()
 
-# --- OpenAI & DB config (force psycopg v3 driver) ---
+# ---------- OpenAI & DB config ----------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or ""
 RAW_DATABASE_URL = os.getenv("DATABASE_URL") or ""
 
 def _normalize_db_url(url: str) -> str:
-    if not url:
-        return url
-    # Convert older "postgres://" to "postgresql://"
     if url.startswith("postgres://"):
         url = "postgresql://" + url[len("postgres://"):]
-    # Ensure SQLAlchemy uses psycopg v3 driver (NOT psycopg2)
     if url.startswith("postgresql://") and "+psycopg" not in url and "+psycopg2" not in url:
         url = url.replace("postgresql://", "postgresql+psycopg://", 1)
     return url
 
-def _strip_bad_params(url: str) -> str:
-    """
-    Removes parameters that libpq/psycopg don't understand (e.g., gai_family).
-    Keeps everything else intact.
-    """
-    try:
-        p = urlparse(url)
-        qs = dict(parse_qsl(p.query, keep_blank_values=True))
-        # Drop any variant casing just in case
-        for bad in list(qs.keys()):
-            if bad.lower() == "gai_family":
-                qs.pop(bad, None)
-        new_q = urlencode(qs, doseq=True)
-        return urlunparse((p.scheme, p.netloc, p.path, p.params, new_q, p.fragment))
-    except Exception:
-        return url  # if parsing fails, just return original
+def _strip_query_param(url: str, key: str) -> str:
+    """Remove a specific query parameter from a URL."""
+    if not url:
+        return url
+    parts = urlsplit(url)
+    q = [(k, v) for (k, v) in parse_qsl(parts.query, keep_blank_values=True) if k != key]
+    return urlunsplit(parts._replace(query=urlencode(q)))
 
-DATABASE_URL = _strip_bad_params(_normalize_db_url(RAW_DATABASE_URL))
+DATABASE_URL = _normalize_db_url(RAW_DATABASE_URL)
+# IMPORTANT: remove prepare_threshold from URL so we can pass it as an int in connect_args
+DATABASE_URL = _strip_query_param(DATABASE_URL, "prepare_threshold")
 
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY missing")
@@ -55,9 +44,12 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL missing")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
-engine = sa.create_engine(DATABASE_URL, future=True)
 
-# -------- App & Static --------
+# Pass prepare_threshold as an int to psycopg via connect_args
+ENGINE_CONNECT_ARGS = {"prepare_threshold": 0, "channel_binding": "disable"}
+engine = sa.create_engine(DATABASE_URL, future=True, connect_args=ENGINE_CONNECT_ARGS)
+
+# ---------- App & Static ----------
 app = FastAPI(title="NIH Grants Chatbot (MVP)")
 app.add_middleware(
     CORSMiddleware,
@@ -65,41 +57,23 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
-# Serve the web UI at /app (files in ./static)
 app.mount("/app", StaticFiles(directory="static", html=True), name="static")
 
-# Also serve root "/" for convenience
 @app.get("/", response_class=HTMLResponse)
 def root_index():
     return FileResponse("static/index.html")
 
-# -------- Debug helpers (safe, redacted) --------
-def _redact_url(u: str) -> str:
-    try:
-        p = urlparse(u)
-        netloc = p.netloc
-        if "@" in netloc:
-            creds, host = netloc.split("@", 1)
-            if ":" in creds:
-                user, _ = creds.split(":", 1)
-                netloc = f"{user}:***@{host}"
-            else:
-                netloc = f"{creds}:***@{host}"
-        return urlunparse((p.scheme, netloc, p.path, p.params, p.query, p.fragment))
-    except Exception:
-        return "***"
-
-from sqlalchemy import text as _sa_text
-
+# ---------- Debug ----------
 @app.get("/_debug/env")
 def _debug_env():
-    raw = os.getenv("DATABASE_URL", "")
     return {
-        "raw": _redact_url(raw),
-        "normalized": _redact_url(_normalize_db_url(raw)),
-        "effective": _redact_url(DATABASE_URL),
+        "raw": RAW_DATABASE_URL,
+        "normalized": _normalize_db_url(RAW_DATABASE_URL),
+        "effective": DATABASE_URL,
+        "connect_args": ENGINE_CONNECT_ARGS,
     }
 
+from sqlalchemy import text as _sa_text
 @app.get("/_debug/db")
 def _debug_db():
     try:
@@ -123,15 +97,6 @@ def health():
         msg = f"db_error: {e.__class__.__name__}"
     return {"ok": ok, "db_ok": db_ok, "message": msg}
 
-# -------- Admin API key auth --------
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
-
-def require_admin(x_api_key: str = Header(None)):
-    if not ADMIN_API_KEY:
-        return  # auth disabled if not set
-    if x_api_key != ADMIN_API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
 @app.get("/models")
 def list_models():
     try:
@@ -140,7 +105,16 @@ def list_models():
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"OpenAI error: {type(e).__name__}")
 
-# ----- Simple /ask (no RAG) -----
+# ---------- Admin API key auth ----------
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
+
+def require_admin(x_api_key: str = Header(None)):
+    if not ADMIN_API_KEY:
+        return
+    if x_api_key != ADMIN_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+# ---------- Simple /ask ----------
 class AskRequest(BaseModel):
     question: str
 
@@ -169,7 +143,7 @@ def ask(req: AskRequest):
                 continue
             raise HTTPException(status_code=503, detail=f"LLM error: {type(e).__name__}")
 
-# ----- FOA endpoints -----
+# ---------- FOA endpoints ----------
 FOA_RE = re.compile(r"\b(RFA|PA|PAR)-[A-Z]{2,}-\d{2}-\d{3}[A-Z]?\b", re.IGNORECASE)
 NOTICE_RE = re.compile(r"\bNOT-[A-Z]{2,}-\d{2}-\d{3}\b", re.IGNORECASE)
 
@@ -223,7 +197,7 @@ def get_foa_meta(foa_number: str):
         "key_dates": kd,
     }
 
-# ----- RAG helpers (Hybrid + MMR) -----
+# ---------- RAG helpers ----------
 def embed_query(q: str):
     return client.embeddings.create(model="text-embedding-3-small", input=[q]).data[0].embedding
 
@@ -245,7 +219,7 @@ def _cosine(a, b):
 def mmr_rerank(q_vec, cand_vecs, k=6, lambda_mult=0.7):
     if not cand_vecs: return []
     selected, remaining = [], list(range(len(cand_vecs)))
-    rel = [ _cosine(q_vec, v) for v in cand_vecs ]
+    rel = [_cosine(q_vec, v) for v in cand_vecs]
     while remaining and len(selected) < k:
         if not selected:
             i = max(remaining, key=lambda idx: rel[idx])
@@ -258,13 +232,12 @@ def mmr_rerank(q_vec, cand_vecs, k=6, lambda_mult=0.7):
     return selected
 
 def retrieve_top_chunks(query: str, k: int = 6, foa_hint: str = None):
-    qe = embed_query(query)  # Python list
+    qe = embed_query(query)
     topN = max(12, k * 4)
     try:
         with engine.begin() as conn:
             raw = conn.connection.driver_connection
-            register_vector(raw)  # enables list<->vector adaptation
-
+            register_vector(raw)
             def candidates_sql(where_extra: str = "", params: dict = None):
                 params = params or {}
                 rows = conn.execute(text(f"""
@@ -277,7 +250,6 @@ def retrieve_top_chunks(query: str, k: int = 6, foa_hint: str = None):
                     LIMIT :n
                 """), {"qe": qe, "n": topN, **params}).fetchall()
                 return [{"content": r.content, "title": r.title, "url": r.url, "emb": _to_list(r.emb)} for r in rows]
-
             if foa_hint:
                 like = f"%{foa_hint.upper()}%"
                 cands = candidates_sql("WHERE d.url ILIKE :like OR d.title ILIKE :like", {"like": like})
@@ -285,7 +257,6 @@ def retrieve_top_chunks(query: str, k: int = 6, foa_hint: str = None):
                     vecs = [c["emb"] for c in cands]
                     keep = mmr_rerank(qe, vecs, k=k, lambda_mult=0.7)
                     return [cands[i] for i in keep]
-
             cands = []
             try:
                 cands = candidates_sql(
@@ -294,12 +265,10 @@ def retrieve_top_chunks(query: str, k: int = 6, foa_hint: str = None):
                 )
             except sa_exc.DBAPIError:
                 cands = []
-
             if not cands:
                 cands = candidates_sql()
             if not cands:
                 return []
-
             vecs = [c["emb"] for c in cands]
             keep = mmr_rerank(qe, vecs, k=k, lambda_mult=0.7)
             return [cands[i] for i in keep]
@@ -376,7 +345,7 @@ def ask_rag(req: AskRequest):
                 continue
             raise HTTPException(status_code=503, detail=f"LLM error: {type(e).__name__}")
 
-# ----- Admin: stats (protected) -----
+# ---------- Admin: stats ----------
 @app.get("/admin/stats", dependencies=[Depends(require_admin)])
 def admin_stats():
     with engine.begin() as conn:
@@ -399,7 +368,7 @@ def admin_stats():
         "last_foa_seen": to_iso(last_foa),
     }
 
-# ----- Admin: recent changes (protected) -----
+# ---------- Admin: recent changes ----------
 @app.get("/admin/changes", dependencies=[Depends(require_admin)])
 def admin_changes(limit: int = 50):
     with engine.begin() as conn:
@@ -413,18 +382,13 @@ def admin_changes(limit: int = 50):
     for r in rows:
         seen_iso = r.seen_at.isoformat() if hasattr(r.seen_at, "isoformat") else str(r.seen_at)
         out.append({
-            "id": r.id,
-            "kind": r.kind,
-            "url": r.url,
-            "title": r.title,
-            "summary": r.change_summary,
-            "seen_at": seen_iso,
+            "id": r.id, "kind": r.kind, "url": r.url,
+            "title": r.title, "summary": r.change_summary, "seen_at": seen_iso,
         })
     return out
 
-# ----- Admin: on-demand ingest/refresh (protected) -----
+# ---------- Admin: on-demand ingest/refresh ----------
 def guess_foa_url(foa_number: str):
-    """Return likely NIH Guide URL(s) for a given FOA/Notice number."""
     n = foa_number.upper()
     if n.startswith("RFA-"):
         return [f"https://grants.nih.gov/grants/guide/rfa-files/{n}.htm",
