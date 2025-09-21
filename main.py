@@ -215,28 +215,57 @@ def mmr_rerank(q_vec, cand_vecs, k=6, lambda_mult=0.7):
         selected.append(i); remaining.remove(i)
     return selected
 
-def _candidate_rows(conn, qe: List[float], topN: int, where_extra: str = "", params: dict = None):
+def _candidate_rows(
+    conn,
+    qe: List[float],
+    topN: int,
+    where_extra: str = "",
+    params: dict | None = None,
+    policy_bias: bool = False,
+):
     """
-    Always cast the param to vector to avoid 'vector <-> double precision[]' errors.
+    Always CAST the param to vector to avoid 'vector <-> double precision[]' errors.
+    Optionally bias toward policy/how-to/standard-due-dates pages for generic queries.
     """
     params = params or {}
-    rows = conn.execute(text(f"""
+
+    base_expr = "e.embedding <-> CAST(:qe AS vector)"
+    if policy_bias:
+        # Lower is better for distance; subtract a small epsilon for desired pages.
+        bias_case = """
+            + CASE
+                WHEN d.url ILIKE '%/how-to-apply-application-guide/%' THEN -0.08
+                WHEN d.url ILIKE '%/grants-process/%'                 THEN -0.06
+                WHEN d.url ILIKE '%/due-dates%'                       THEN -0.12
+                WHEN d.url ILIKE '%/nihgps/%'                         THEN -0.05
+                WHEN d.title ILIKE '%standard due date%'              THEN -0.12
+                WHEN d.title ILIKE '%application guide%'              THEN -0.08
+                ELSE 0.0
+              END
+        """
+        order_expr = f"{base_expr} {bias_case}"
+    else:
+        order_expr = base_expr
+
+    sql = f"""
         SELECT c.content, d.title, d.url, e.embedding AS emb
         FROM embeddings e
         JOIN chunks c ON c.id = e.chunk_id
         JOIN documents d ON d.id = c.doc_id
         {where_extra}
-        ORDER BY e.embedding <-> CAST(:qe AS vector)
+        ORDER BY {order_expr}
         LIMIT :n
-    """), {"qe": qe, "n": topN, **params}).fetchall()
+    """
+    rows = conn.execute(text(sql), {"qe": qe, "n": topN, **params}).fetchall()
     return [{"content": r.content, "title": r.title, "url": r.url, "emb": _to_list(r.emb)} for r in rows]
 
 def retrieve_top_chunks(query: str, k: int = 6, foa_hint: str = None):
     """
     1) Try FOA-constrained search (if hint present)
-    2) Else hybrid: FTS pre-filter + vector rank (if chunks.ts exists)
+    2) Else hybrid: FTS pre-filter + vector rank
     3) Else pure vector
     Then MMR to diversify results.
+    Bias toward policy/how-to pages only for generic (non-FOA) queries.
     """
     try:
         qe = embed_query(query)  # Python list
@@ -252,22 +281,28 @@ def retrieve_top_chunks(query: str, k: int = 6, foa_hint: str = None):
             raw = conn.connection.driver_connection
             register_vector(raw)
 
-            # 1) FOA-focused
+            # 1) FOA-focused (no bias here; we want the FOA itself)
             if foa_hint:
                 like = f"%{foa_hint.upper()}%"
-                cands = _candidate_rows(conn, qe, topN, "WHERE d.url ILIKE :like OR d.title ILIKE :like", {"like": like})
+                cands = _candidate_rows(
+                    conn, qe, topN,
+                    "WHERE d.url ILIKE :like OR d.title ILIKE :like",
+                    {"like": like},
+                    policy_bias=False,
+                )
                 if cands:
                     vecs = [c["emb"] for c in cands]
                     keep = mmr_rerank(qe, vecs, k=k, lambda_mult=0.7)
                     return [cands[i] for i in keep]
 
-            # 2) Hybrid FTS pre-filter (gracefully skip if chunks.ts doesn't exist)
+            # 2) Hybrid FTS pre-filter (bias ON only for generic queries)
             cands = []
             try:
                 cands = _candidate_rows(
                     conn, qe, topN,
                     "WHERE c.ts @@ plainto_tsquery('english', :ftsq)",
-                    {"ftsq": query}
+                    {"ftsq": query},
+                    policy_bias=(foa_hint is None),
                 )
             except sa_exc.DBAPIError:
                 cands = []  # FTS not available; ignore and fall back
@@ -276,17 +311,18 @@ def retrieve_top_chunks(query: str, k: int = 6, foa_hint: str = None):
 
             if not cands:
                 # 3) Pure vector fallback across entire corpus
-                cands = _candidate_rows(conn, qe, topN)
+                cands = _candidate_rows(
+                    conn, qe, topN,
+                    policy_bias=(foa_hint is None),
+                )
 
             if not cands:
-                # Last-ditch: keyword prefilter on known high-value URLs (won't always hit)
-                try:
-                    cands = _candidate_rows(
-                        conn, qe, topN,
-                        "WHERE d.url ILIKE '%/due-dates-and-submission-policies/%' OR d.url ILIKE '%/due-dates.htm%'"
-                    )
-                except Exception:
-                    cands = []
+                # Targeted last-ditch: pages we KNOW are relevant for due dates
+                cands = _candidate_rows(
+                    conn, qe, topN,
+                    "WHERE d.url ILIKE '%/due-dates-and-submission-policies/%' OR d.url ILIKE '%/due-dates.htm%'",
+                    policy_bias=True,
+                )
 
             if not cands:
                 return []
