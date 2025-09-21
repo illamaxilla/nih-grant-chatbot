@@ -20,18 +20,19 @@ from dotenv import load_dotenv
 try:
     import tiktoken  # real package
 except Exception:
-    import re
-    _WORD_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
+    import re as _re
+    _WORD_RE = _re.compile(r"\w+|[^\w\s]", _re.UNICODE)
 
     class _StubTiktoken:
         def get_encoding(self, name: str):
             class _Enc:
                 def encode(self, s: str):
-                    # Return a token-like list (words & punctuation) so len(encode(...)) still works
+                    # token-ish: words & punctuation
                     return _WORD_RE.findall(s or "")
+                def decode(self, toks):
+                    return "".join(toks) if isinstance(toks, list) else str(toks or "")
             return _Enc()
 
-        # Some code uses encoding_for_model; map it to get_encoding.
         def encoding_for_model(self, name: str):
             return self.get_encoding(name)
 
@@ -39,17 +40,36 @@ except Exception:
 # --- end shim ---
 
 from openai import OpenAI
-from pgvector.psycopg import register_vector, Vector
+from pgvector.psycopg import register_vector          # psycopg3 adapter
+from pgvector.sqlalchemy import Vector                 # SQLAlchemy type
 from pdfminer.high_level import extract_text as pdf_extract_text
 
 # ---------------- Env & clients ----------------
 load_dotenv()
-DATABASE_URL = os.getenv("DATABASE_URL")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not DATABASE_URL or not OPENAI_API_KEY:
-    raise RuntimeError("DATABASE_URL or OPENAI_API_KEY missing in .env")
 
-engine = sa.create_engine(DATABASE_URL, future=True)
+RAW_DATABASE_URL = os.getenv("DATABASE_URL") or ""
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or ""
+if not RAW_DATABASE_URL or not OPENAI_API_KEY:
+    raise RuntimeError("DATABASE_URL or OPENAI_API_KEY missing in environment")
+
+def _normalize_db_url(url: str) -> str:
+    # Convert older "postgres://" to "postgresql://"
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+    # Ensure SQLAlchemy uses psycopg v3 driver (NOT psycopg2)
+    if url.startswith("postgresql://") and "+psycopg" not in url and "+psycopg2" not in url:
+        url = url.replace("postgresql://", "postgresql+psycopg://", 1)
+    return url
+
+DATABASE_URL = _normalize_db_url(RAW_DATABASE_URL)
+
+# Match main.py connection behavior to avoid auth issues (e.g., channel binding)
+ENGINE_CONNECT_ARGS = {
+    "prepare_threshold": 0,
+    "channel_binding": "disable",
+}
+
+engine = sa.create_engine(DATABASE_URL, future=True, connect_args=ENGINE_CONNECT_ARGS)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ---------------- Seeds (core coverage) ----------------
@@ -102,10 +122,9 @@ OVERLAP_TOKENS = 80
 enc = tiktoken.get_encoding("cl100k_base")
 
 USER_AGENT = "NIH-Grant-Chatbot/1.0 (+yourdomain.com/contact)"
-HEADERS = {"User-Agent": USER_AGENT}
+HEADERS = {"User-Agent": USER_AGENT, "Accept": "*/*"}
 
 # ---------------- FOA / Notice detection ----------------
-# Accept both .htm and .html, case-insensitive
 FOA_HTML_RE = re.compile(
     r"/grants/guide/(?:rfa|pa|par)-files/(?:RFA|PA|PAR)-[A-Z0-9\-]+\.htm(l)?$",
     re.IGNORECASE,
@@ -115,11 +134,9 @@ NOTICE_HTML_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Numbers in text or URL
 FOA_NUM_RE = re.compile(r"\b(RFA|PA|PAR)-[A-Z]{2,}-\d{2}-\d{3}[A-Z]?\b", re.IGNORECASE)
 NOTICE_NUM_RE = re.compile(r"\bNOT-[A-Z]{2,}-\d{2}-\d{3}\b", re.IGNORECASE)
 
-# Extract from URL directly (preferred)
 FOA_NUM_FROM_URL_RE = re.compile(r"(RFA|PA|PAR)-[A-Z]{2,}-\d{2}-\d{3}[A-Z]?", re.IGNORECASE)
 NOTICE_NUM_FROM_URL_RE = re.compile(r"(NOT-[A-Z]{2,}-\d{2}-\d{3})", re.IGNORECASE)
 
@@ -137,12 +154,13 @@ def chunk_text(text: str, target=CHUNK_TARGET_TOKENS, overlap=OVERLAP_TOKENS) ->
     chunks, i = [], 0
     while i < len(toks):
         j = min(i + target, len(toks))
-        chunks.append(enc.decode(toks[i:j]))
+        # For real tiktoken we should decode bytes back to str; the shim returns tokens as strings already
+        piece = enc.decode(toks[i:j]) if hasattr(enc, "decode") else "".join(toks[i:j])
+        chunks.append(piece)
         i = j - overlap if j - overlap > i else j
     return chunks
 
 def embed_with_retry(texts: List[str]) -> List[List[float]]:
-    # 1536-dim model to match DB schema
     max_tries = 5
     for attempt in range(max_tries):
         try:
@@ -163,7 +181,7 @@ def fetch_and_parse(url: str) -> Tuple[str, str, List[str], str]:
     Returns (title, text, pdf_links, content_type) where content_type is 'pdf' or 'html'.
     For HTML, also returns discovered NIH PDF links.
     """
-    r = requests.get(url, timeout=45, headers=HEADERS)
+    r = requests.get(url, timeout=45, headers=HEADERS, allow_redirects=True)
     r.raise_for_status()
     ctype = (r.headers.get("Content-Type") or "").lower()
     is_pdf = ("application/pdf" in ctype) or r.content.startswith(b"%PDF")
@@ -254,8 +272,7 @@ def upsert_document(conn, url: str, title: str, body: str):
 
 def upsert_foa(conn, foa: Dict):
     """
-    Upsert into foas table. key_dates_json is cast using CAST(:param AS JSONB)
-    to avoid driver-specific placeholder issues.
+    Upsert into foas table. key_dates_json is cast using CAST(:param AS JSONB).
     """
     by_number = foa.get("foa_number")
     if by_number:
@@ -320,10 +337,14 @@ def extract_foa_fields_from_text(url: str, title: str, text_body: str) -> Dict:
     # Prefer number from URL
     if FOA_HTML_RE.search(url):
         m = FOA_NUM_FROM_URL_RE.search(url)
-        if m: d["foa_number"] = m.group(0).upper(); d["foa_type"] = d["foa_number"].split("-")[0]
+        if m:
+            d["foa_number"] = m.group(0).upper()
+            d["foa_type"] = d["foa_number"].split("-")[0]
     elif NOTICE_HTML_RE.search(url):
         m = NOTICE_NUM_FROM_URL_RE.search(url)
-        if m: d["foa_number"] = m.group(0).upper(); d["foa_type"] = "NOT"
+        if m:
+            d["foa_number"] = m.group(0).upper()
+            d["foa_type"] = "NOT"
 
     # Fall back to body text if still missing
     if not d.get("foa_number"):
@@ -332,7 +353,6 @@ def extract_foa_fields_from_text(url: str, title: str, text_body: str) -> Dict:
             d["foa_number"] = m.group(0).upper()
             d["foa_type"] = d["foa_number"].split("-")[0] if d["foa_number"].startswith(("RFA","PA","PAR")) else "NOT"
 
-    # Title from page if present
     d["title"] = title or d.get("title")
 
     # Activity Codes
@@ -370,8 +390,10 @@ def is_notice_page(url: str) -> bool:
 
 # ---------------- Save chunks & embeddings ----------------
 def save_chunks_and_embeddings(conn, doc_id: int, chunks: List[str], embeddings: List[List[float]]):
+    # Register adapter so plain Python lists map to the 'vector' type
     raw = conn.connection.driver_connection
     register_vector(raw)
+
     for idx, (content, emb) in enumerate(zip(chunks, embeddings), start=1):
         res = conn.execute(
             text(
@@ -384,9 +406,11 @@ def save_chunks_and_embeddings(conn, doc_id: int, chunks: List[str], embeddings:
             {"doc": doc_id, "ord": idx, "hp": None, "ct": content, "tk": len(enc.encode(content))},
         )
         chunk_id = res.scalar_one()
+
+        # IMPORTANT: pass the raw list; psycopg3 + register_vector handles adaptation.
         conn.execute(
             text("INSERT INTO embeddings (chunk_id, embedding) VALUES (:cid, :emb)"),
-            {"cid": chunk_id, "emb": Vector(emb)},
+            {"cid": chunk_id, "emb": emb},
         )
 
 # ---------------- Main ingest function ----------------
