@@ -231,7 +231,7 @@ def _candidate_rows(
 
     base_expr = "e.embedding <-> CAST(:qe AS vector)"
     if policy_bias:
-        # Lower is better for distance; subtract a small epsilon for desired pages.
+        # Lower is better; subtract a small epsilon for desired pages.
         bias_case = """
             + CASE
                 WHEN d.url ILIKE '%/how-to-apply-application-guide/%' THEN -0.08
@@ -259,30 +259,75 @@ def _candidate_rows(
     rows = conn.execute(text(sql), {"qe": qe, "n": topN, **params}).fetchall()
     return [{"content": r.content, "title": r.title, "url": r.url, "emb": _to_list(r.emb)} for r in rows]
 
+def _keyword_fallback_rows(conn, query: str, k: int = 6) -> List[Dict[str, Any]]:
+    """
+    LAST-RESORT: If vector/FTS yields nothing, fall back to simple keyword filters
+    over high-signal NIH policy pages. No embeddings required.
+    """
+    # Build a few loose patterns; include due-dates, application guide, nihgps, peer review.
+    patterns = [
+        "%/due-dates-and-submission-policies/%",
+        "%/due-dates.htm%",
+        "%/how-to-apply-application-guide/%",
+        "%/nihgps/%",
+        "%/peer-review.htm%",
+    ]
+    # Also search for the user's key words in title/content.
+    words = [w for w in re.findall(r"[A-Za-z0-9]{3,}", query)][:5]
+    like_params = {f"p{i}": p for i, p in enumerate(patterns)}
+    wc = []
+    for i in range(len(patterns)):
+        wc.append(f"d.url ILIKE :p{i}")
+    # Add up to 5 keywords into title/content
+    for j, w in enumerate(words):
+        like_params[f"w{j}"] = f"%{w}%"
+        wc.append(f"d.title ILIKE :w{j}")
+        wc.append(f"c.content ILIKE :w{j}")
+
+    where_clause = "WHERE " + " OR ".join(wc) if wc else ""
+    sql = f"""
+        SELECT c.content, d.title, d.url
+        FROM chunks c
+        JOIN documents d ON d.id = c.doc_id
+        {where_clause}
+        ORDER BY
+            CASE
+              WHEN d.url ILIKE '%/due-dates%' THEN 0
+              WHEN d.url ILIKE '%/nihgps/%' THEN 1
+              WHEN d.url ILIKE '%/how-to-apply-application-guide/%' THEN 2
+              ELSE 3
+            END,
+            length(c.content) DESC
+        LIMIT :n
+    """
+    rows = conn.execute(text(sql), {**like_params, "n": max(12, k * 4)}).fetchall()
+    out = [{"content": r.content, "title": r.title, "url": r.url, "emb": None} for r in rows]
+    # Return only k items (no MMR here since we may not have embeddings)
+    return out[:k]
+
 def retrieve_top_chunks(query: str, k: int = 6, foa_hint: str = None):
     """
     1) Try FOA-constrained search (if hint present)
     2) Else hybrid: FTS pre-filter + vector rank
     3) Else pure vector
-    Then MMR to diversify results.
-    Bias toward policy/how-to pages only for generic (non-FOA) queries.
+    4) Else keyword-only fallback over policy pages
+    Then MMR to diversify results (when embeddings exist).
     """
+    qe: Optional[List[float]] = None
     try:
         qe = embed_query(query)  # Python list
     except Exception:
-        # If embeddings call fails for any reason, don't crash the request.
-        return []
+        qe = None  # allow fallback path
 
     topN = max(12, k * 4)
 
     try:
         with engine.begin() as conn:
-            # Register adapter for pgvector (safeguard, though CAST handles most cases)
             raw = conn.connection.driver_connection
             register_vector(raw)
 
-            # 1) FOA-focused (no bias here; we want the FOA itself)
-            if foa_hint:
+            # 1) FOA-focused (no policy bias)
+            if qe is not None and foa_hint:
                 like = f"%{foa_hint.upper()}%"
                 cands = _candidate_rows(
                     conn, qe, topN,
@@ -295,43 +340,49 @@ def retrieve_top_chunks(query: str, k: int = 6, foa_hint: str = None):
                     keep = mmr_rerank(qe, vecs, k=k, lambda_mult=0.7)
                     return [cands[i] for i in keep]
 
-            # 2) Hybrid FTS pre-filter (bias ON only for generic queries)
-            cands = []
-            try:
-                cands = _candidate_rows(
-                    conn, qe, topN,
-                    "WHERE c.ts @@ plainto_tsquery('english', :ftsq)",
-                    {"ftsq": query},
-                    policy_bias=(foa_hint is None),
-                )
-            except sa_exc.DBAPIError:
-                cands = []  # FTS not available; ignore and fall back
-            except Exception:
-                cands = []
+            # 2) FTS + vector (bias ON for generic queries)
+            cands: List[Dict[str, Any]] = []
+            if qe is not None:
+                try:
+                    cands = _candidate_rows(
+                        conn, qe, topN,
+                        "WHERE c.ts @@ plainto_tsquery('english', :ftsq)",
+                        {"ftsq": query},
+                        policy_bias=(foa_hint is None),
+                    )
+                except sa_exc.DBAPIError:
+                    cands = []
+                except Exception:
+                    cands = []
 
-            if not cands:
-                # 3) Pure vector fallback across entire corpus
-                cands = _candidate_rows(
-                    conn, qe, topN,
-                    policy_bias=(foa_hint is None),
-                )
+            # 3) Pure vector fallback
+            if not cands and qe is not None:
+                try:
+                    cands = _candidate_rows(
+                        conn, qe, topN,
+                        policy_bias=(foa_hint is None),
+                    )
+                except Exception:
+                    cands = []
 
+            # 4) Keyword-only fallback over policy pages (no embeddings required)
             if not cands:
-                # Targeted last-ditch: pages we KNOW are relevant for due dates
-                cands = _candidate_rows(
-                    conn, qe, topN,
-                    "WHERE d.url ILIKE '%/due-dates-and-submission-policies/%' OR d.url ILIKE '%/due-dates.htm%'",
-                    policy_bias=True,
-                )
+                try:
+                    cands = _keyword_fallback_rows(conn, query, k=k)
+                except Exception:
+                    cands = []
 
             if not cands:
                 return []
 
-            vecs = [c["emb"] for c in cands]
-            keep = mmr_rerank(qe, vecs, k=k, lambda_mult=0.7)
-            return [cands[i] for i in keep]
+            # If embeddings present, apply MMR; else return as-is
+            if qe is not None and all(c.get("emb") for c in cands):
+                vecs = [c["emb"] for c in cands]
+                keep = mmr_rerank(qe, vecs, k=k, lambda_mult=0.7)
+                return [cands[i] for i in keep]
+            else:
+                return cands[:k]
     except Exception:
-        # If anything DB-related blows up, return empty so caller can show a friendly message
         return []
 
 def build_context(cands):
