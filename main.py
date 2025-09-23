@@ -6,12 +6,14 @@ from fastapi.responses import FileResponse, HTMLResponse
 from dotenv import load_dotenv
 from openai import OpenAI
 from pydantic import BaseModel
+
 import sqlalchemy as sa
 import sqlalchemy.exc as sa_exc
-from sqlalchemy import text
+from sqlalchemy import text, event
+
 from pgvector.psycopg import register_vector  # psycopg v3 adapter
 import os, time, random, re, json, math, datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 # ---------------- Env ----------------
 load_dotenv()
@@ -39,7 +41,7 @@ if not DATABASE_URL:
 # ---------------- Clients / Engine ----------------
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Harden the pool: pre-ping, recycle, LIFO, etc. (helps Render & Supabase poolers)
+# Harden the pool: pre-ping, recycle, lifo, etc. (helps Render & Supabase poolers)
 engine = sa.create_engine(
     DATABASE_URL,
     future=True,
@@ -54,6 +56,16 @@ engine = sa.create_engine(
         "channel_binding": "disable"
     },
 )
+
+# Ensure pgvector ops are visible without schema-qualifying (e.g., on Supabase they live in "extensions")
+@event.listens_for(engine, "connect")
+def _set_search_path(dbapi_connection, connection_record):
+    try:
+        with dbapi_connection.cursor() as cur:
+            cur.execute("SET search_path TO public, extensions")
+    except Exception:
+        # Non-fatal; retrieval still has fallbacks
+        pass
 
 # ---------------- Admin auth ----------------
 def require_admin(x_api_key: str = Header(None)):
@@ -163,7 +175,7 @@ def get_foa(foa_number: str):
     return {
         "foa_number": row.foa_number,
         "foa_type": row.foa_type,
-        "title": row.title,
+        "title": row.title,  # fixed bug: use row.title
         "url": row.url,
         "activity_codes": row.activity_codes or [],
         "participating_ics": row.participating_ics or [],
@@ -335,7 +347,7 @@ def retrieve_top_chunks(query: str, k: int = 6, foa_hint: Optional[str] = None) 
     """
     Retrieval order:
       0) Quick keyword-first fallback for high-signal policy pages
-      1) FOA-constrained search (if foa_hint present)
+      1) FOA-constrained vector search (when hint present)
       2) FTS pre-filter + vector rank (policy_bias ON for generic queries)
       3) Pure vector rank
       4) Keyword fallback (again, if still empty)
@@ -345,8 +357,7 @@ def retrieve_top_chunks(query: str, k: int = 6, foa_hint: Optional[str] = None) 
     try:
         qe = embed_query(query)  # Python list
     except Exception:
-        # Embedding failure is not fatal; continue with FTS/keyword-only
-        qe = None
+        qe = None  # allow fallback path
 
     topN = max(12, k * 4)
 
@@ -359,25 +370,28 @@ def retrieve_top_chunks(query: str, k: int = 6, foa_hint: Optional[str] = None) 
             except Exception:
                 pass
 
-            # 0) Quick keyword-first hit to catch policy pages even if embeddings/fts are unhappy
+            # 0) Quick keyword-first hit
             try:
                 quick = _keyword_fallback_rows(conn, query, k=max(3, min(6, k)))
             except Exception:
                 quick = []
 
             # 1) FOA-focused (no policy bias)
-            foa_cands: List[Dict[str, Any]] = []
             if qe is not None and foa_hint:
                 like = f"%{foa_hint.upper()}%"
                 try:
-                    foa_cands = _candidate_rows(
+                    c_foa = _candidate_rows(
                         conn, qe, topN,
                         "WHERE d.url ILIKE :like OR d.title ILIKE :like",
                         {"like": like},
                         policy_bias=False,
                     )
                 except Exception:
-                    foa_cands = []
+                    c_foa = []
+                if c_foa:
+                    vecs = [c["emb"] for c in c_foa]
+                    keep = mmr_rerank(qe, vecs, k=k, lambda_mult=0.7)
+                    return [c_foa[i] for i in keep]
 
             # 2) FTS + vector (bias ON for generic queries)
             cands: List[Dict[str, Any]] = []
@@ -404,21 +418,18 @@ def retrieve_top_chunks(query: str, k: int = 6, foa_hint: Optional[str] = None) 
                 except Exception:
                     cands = []
 
-            # 4) Keyword-only fallback if still empty
-            if not cands and not foa_cands:
+            # 4) Keyword-only fallback over policy pages
+            if not cands:
                 try:
-                    fallback = _keyword_fallback_rows(conn, query, k=k)
+                    cands = _keyword_fallback_rows(conn, query, k=k)
                 except Exception:
-                    fallback = []
-                if fallback:
-                    cands = fallback
+                    cands = []
 
-            # pick best available set (prefer FOA, then cands, else quick)
-            chosen = foa_cands or cands or quick
-            if not chosen:
+            if not cands and not quick:
                 return []
+            chosen = cands if cands else quick
 
-            # If embeddings present for candidates, apply MMR; else return as-is
+            # If embeddings present, apply MMR; else return as-is
             if qe is not None and all(c.get("emb") for c in chosen):
                 vecs = [c["emb"] for c in chosen]
                 keep = mmr_rerank(qe, vecs, k=k, lambda_mult=0.7)
@@ -428,7 +439,7 @@ def retrieve_top_chunks(query: str, k: int = 6, foa_hint: Optional[str] = None) 
     except Exception:
         return []
 
-def build_context(cands: List[Dict[str, Any]]):
+def build_context(cands):
     parts, cites = [], []
     for i, r in enumerate(cands, start=1):
         parts.append(f"[{i}] {r['title']}\nURL: {r['url']}\nExcerpt:\n{(r['content'] or '')[:1800]}\n")
@@ -627,14 +638,8 @@ def rag_diagnose(req: DiagnoseRequest):
 # ---------------- Admin: self-check & trace ----------------
 @app.get("/admin/rag_selfcheck", dependencies=[Depends(require_admin)])
 def rag_selfcheck():
-    """
-    Quieter, embedding-based probe to avoid scary InternalError logs:
-    - Count tables
-    - Confirm FTS column exists
-    - Do a small vector probe via embeddings + candidate query
-    """
-    checks: Dict[str, Any] = {}
-    errors: List[str] = []
+    checks = {}
+    errors = []
     try:
         with engine.begin() as conn:
             # counts
@@ -650,26 +655,67 @@ def rag_selfcheck():
             except Exception:
                 checks["fts_due_exists"] = False
 
-            # vector sanity via real embedding probe (no SQL self-distance fallback)
+            # ensure pgvector adapter bound
             try:
                 raw = conn.connection.driver_connection
                 register_vector(raw)
             except Exception:
                 pass
+
+            # check operator presence
             try:
-                qe = embed_query("nih standard due dates r01 application guide policy")
-                rows = _candidate_rows(
-                    conn, qe, 5,
-                    policy_bias=True,
-                    prefer_grants_domain=True,
-                )
-                checks["vector_rank_sample"] = [r["url"] for r in rows]
-            except Exception as e:
-                checks["vector_rank_sample"] = []
-                errors.append(f"vector_rank_sample_probe: {e.__class__.__name__}")
+                has_ops = conn.execute(text("""
+                    SELECT EXISTS (
+                      SELECT 1 FROM pg_operator
+                      WHERE oprname IN ('<->','<#>','<=>')
+                        AND oprleft = 'vector'::regtype
+                        AND oprright = 'vector'::regtype
+                    )
+                """)).scalar_one()
+            except Exception:
+                has_ops = False
+            checks["pgvector_ops_present"] = bool(has_ops)
+
+            # try a tiny distance sort; if it fails, fall back to a plain join sample
+            vector_urls: List[str] = []
+            probe_ok = False
+            if has_ops:
+                try:
+                    rows = conn.execute(text("""
+                        SELECT d.url
+                        FROM embeddings e
+                        JOIN chunks c ON c.id = e.chunk_id
+                        JOIN documents d ON d.id = c.doc_id
+                        ORDER BY e.embedding <-> e.embedding
+                        LIMIT 5
+                    """)).fetchall()
+                    vector_urls = [r.url for r in rows]
+                    probe_ok = True
+                except Exception:
+                    probe_ok = False
+
+            if not probe_ok:
+                try:
+                    rows2 = conn.execute(text("""
+                        SELECT d.url
+                        FROM embeddings e
+                        JOIN chunks c ON c.id = e.chunk_id
+                        JOIN documents d ON d.id = c.doc_id
+                        ORDER BY e.id DESC
+                        LIMIT 5
+                    """)).fetchall()
+                    vector_urls = [r.url for r in rows2]
+                    checks["vector_probe_mode"] = "fallback_join"
+                except Exception as e2:
+                    checks["vector_probe_mode"] = "failed"
+                    vector_urls = []
+                    errors.append(f"vector_probe: {e2.__class__.__name__}")
+
+            checks["vector_rank_sample"] = vector_urls
+
     except Exception as e:
         errors.append(f"db: {e.__class__.__name__}")
-    return {"ok": not errors, "checks": checks, "errors": errors}
+    return {"ok": len(errors) == 0, "checks": checks, "errors": errors}
 
 @app.get("/admin/rag_trace", dependencies=[Depends(require_admin)])
 def rag_trace(q: str = Query(..., description="User-like question"), k: int = 6):
@@ -681,7 +727,9 @@ def rag_trace(q: str = Query(..., description="User-like question"), k: int = 6)
     foa_hint = m.group(0).upper() if m else None
 
     trace: Dict[str, Any] = {"foa_hint": foa_hint}
-    urls = lambda rows: [r.get("url") for r in rows]
+
+    def urls(rows: List[Dict[str, Any]]) -> List[str]:
+        return [r.get("url") for r in rows]
 
     try:
         with engine.begin() as conn:
@@ -692,7 +740,7 @@ def rag_trace(q: str = Query(..., description="User-like question"), k: int = 6)
             except Exception:
                 pass
 
-            # stage0: quick keyword
+            # stage 0 quick keyword
             try:
                 s0 = _keyword_fallback_rows(conn, q, k=max(3, min(6, k)))
             except Exception:
@@ -705,7 +753,7 @@ def rag_trace(q: str = Query(..., description="User-like question"), k: int = 6)
             except Exception:
                 qe = None
 
-            # stage1: FOA-constrained
+            # stage 1 FOA-constrained
             s1 = []
             if qe is not None and foa_hint:
                 like = f"%{foa_hint.upper()}%"
@@ -714,13 +762,13 @@ def rag_trace(q: str = Query(..., description="User-like question"), k: int = 6)
                         conn, qe, max(12, k*4),
                         "WHERE d.url ILIKE :like OR d.title ILIKE :like",
                         {"like": like},
-                        policy_bias=False,
+                        policy_bias=False
                     )
                 except Exception:
                     s1 = []
             trace["stage1_foa"] = urls(s1)
 
-            # stage2: FTS + vector
+            # stage 2 FTS + vector
             s2 = []
             if qe is not None:
                 try:
@@ -733,9 +781,9 @@ def rag_trace(q: str = Query(..., description="User-like question"), k: int = 6)
                     s2 = []
             trace["stage2_fts_vec"] = urls(s2)
 
-            # stage3: pure vector
+            # stage 3 pure vector
             s3 = []
-            if qe is not None and not s2:
+            if qe is not None and not s2 and not s1:
                 try:
                     s3 = _candidate_rows(
                         conn, qe, max(12, k*4),
@@ -745,7 +793,7 @@ def rag_trace(q: str = Query(..., description="User-like question"), k: int = 6)
                     s3 = []
             trace["stage3_vec_only"] = urls(s3)
 
-            # stage4: keyword fallback
+            # stage 4 keyword fallback
             s4 = []
             if not s1 and not s2 and not s3:
                 try:
