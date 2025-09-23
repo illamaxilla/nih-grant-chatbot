@@ -10,7 +10,7 @@ import sqlalchemy as sa
 import sqlalchemy.exc as sa_exc
 from sqlalchemy import text
 from pgvector.psycopg import register_vector  # psycopg v3 adapter
-from pgvector.sqlalchemy import Vector        # <-- typed pgvector binds
+from pgvector.sqlalchemy import Vector        # typed pgvector binds
 import os, time, random, re, json, math, datetime
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -171,7 +171,7 @@ def get_foa(foa_number: str):
     return {
         "foa_number": row.foa_number,
         "foa_type": row.foa_type,
-        "title": row.title,   # FIX: was r.title
+        "title": row.title,
         "url": row.url,
         "activity_codes": row.activity_codes or [],
         "participating_ics": row.participating_ics or [],
@@ -280,28 +280,28 @@ def _candidate_rows(
     """
     params = params or {}
 
-    base_expr = "e.embedding <-> CAST(:qe AS vector)"
+    # --- CRITICAL FIX: wrap distance in parentheses so we add numerics to numerics, not to vectors ---
+    base_expr = "(e.embedding <-> CAST(:qe AS vector))"
     penalties = []
 
     if policy_bias:
         penalties.append("""
             + CASE
-                WHEN d.url ILIKE '%/how-to-apply-application-guide/%' THEN -0.08
-                WHEN d.url ILIKE '%/grants-process/%'                 THEN -0.06
-                WHEN d.url ILIKE '%/due-dates%'                       THEN -0.12
-                WHEN d.url ILIKE '%/nihgps/%'                         THEN -0.05
-                WHEN d.title ILIKE '%standard due date%'              THEN -0.12
-                WHEN d.title ILIKE '%application guide%'              THEN -0.08
-                ELSE 0.0
+                WHEN d.url ILIKE '%/how-to-apply-application-guide/%' THEN -0.08::double precision
+                WHEN d.url ILIKE '%/grants-process/%'                 THEN -0.06::double precision
+                WHEN d.url ILIKE '%/due-dates%'                       THEN -0.12::double precision
+                WHEN d.url ILIKE '%/nihgps/%'                         THEN -0.05::double precision
+                WHEN d.title ILIKE '%standard due date%'              THEN -0.12::double precision
+                WHEN d.title ILIKE '%application guide%'              THEN -0.08::double precision
+                ELSE 0.0::double precision
               END
         """)
 
     if prefer_grants_domain:
-        # Smaller is better; lower scores for grants.nih.gov, higher for everything else.
         penalties.append("""
             + CASE
-                WHEN d.url ILIKE 'https://grants.nih.gov/%' THEN -0.20
-                ELSE 0.10
+                WHEN d.url ILIKE 'https://grants.nih.gov/%' THEN -0.20::double precision
+                ELSE 0.10::double precision
               END
         """)
 
