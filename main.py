@@ -39,7 +39,7 @@ if not DATABASE_URL:
 # ---------------- Clients / Engine ----------------
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Harden the pool: pre-ping, recycle, lifo, etc.
+# Harden the pool: pre-ping, recycle, LIFO, etc. (helps Render & Supabase poolers)
 engine = sa.create_engine(
     DATABASE_URL,
     future=True,
@@ -163,7 +163,7 @@ def get_foa(foa_number: str):
     return {
         "foa_number": row.foa_number,
         "foa_type": row.foa_type,
-        "title": row.title,   # fixed variable name
+        "title": row.title,
         "url": row.url,
         "activity_codes": row.activity_codes or [],
         "participating_ics": row.participating_ics or [],
@@ -192,6 +192,7 @@ def get_foa_meta(foa_number: str) -> Optional[Dict[str, Any]]:
 
 # ---------------- RAG helpers (Hybrid + MMR) ----------------
 def embed_query(q: str) -> List[float]:
+    # robust embed call; if it fails, let caller know
     resp = client.embeddings.create(model="text-embedding-3-small", input=[q])
     return resp.data[0].embedding
 
@@ -285,15 +286,17 @@ def _keyword_fallback_rows(conn, query: str, k: int = 6) -> List[Dict[str, Any]]
     LAST-RESORT: If vector/FTS yields nothing, fall back to simple keyword filters
     over high-signal NIH policy pages. No embeddings required.
     """
+    # Broadened high-signal patterns.
     patterns = [
         "%/how-to-apply-application-guide/%",
         "%/due-dates-and-submission-policies/%",
-        "%/due-dates.htm%",
-        "%/standard-due-dates.htm%",
-        "%/submission-policies.htm%",
-        "%/policy/nihgps/%",
-        "%/peer-review.htm%",
+        "%/due-dates.htm%",                 # legacy page
+        "%/standard-due-dates.htm%",        # the page we care about
+        "%/submission-policies.htm%",       # nearby page
+        "%/policy/nihgps/%",                # GPS
+        "%/peer-review.htm%",               # overview
     ]
+    # Extract up to 6 keywords (alnum tokens ≥3 chars)
     words = [w for w in re.findall(r"[A-Za-z0-9]{3,}", query)][:6]
     like_params = {f"p{i}": p for i, p in enumerate(patterns)}
     wc = []
@@ -325,24 +328,25 @@ def _keyword_fallback_rows(conn, query: str, k: int = 6) -> List[Dict[str, Any]]
     return out[:k]
 
 def _fts_where_clause() -> str:
-    # Prefer websearch_to_tsquery for lenient matching
+    # Prefer websearch_to_tsquery for lenient matching (handles quoted phrases, stopwords better)
     return "WHERE c.ts @@ websearch_to_tsquery('english', :ftsq)"
 
 def retrieve_top_chunks(query: str, k: int = 6, foa_hint: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     Retrieval order:
       0) Quick keyword-first fallback for high-signal policy pages
-      1) FOA-focused (if a FOA/Notice hint is in the query)
-      2) FTS pre-filter + vector rank (policy_bias & grants-domain preference for generic queries)
+      1) FOA-constrained search (if foa_hint present)
+      2) FTS pre-filter + vector rank (policy_bias ON for generic queries)
       3) Pure vector rank
       4) Keyword fallback (again, if still empty)
     Then MMR to diversify results (when embeddings exist).
     """
     qe: Optional[List[float]] = None
     try:
-        qe = embed_query(query)
+        qe = embed_query(query)  # Python list
     except Exception:
-        qe = None  # allow fallback path
+        # Embedding failure is not fatal; continue with FTS/keyword-only
+        qe = None
 
     topN = max(12, k * 4)
 
@@ -361,30 +365,29 @@ def retrieve_top_chunks(query: str, k: int = 6, foa_hint: Optional[str] = None) 
             except Exception:
                 quick = []
 
-            # 1) FOA-focused (no domain bias here; FOA pages are typically on grants.nih.gov)
-            cands: List[Dict[str, Any]] = []
+            # 1) FOA-focused (no policy bias)
+            foa_cands: List[Dict[str, Any]] = []
             if qe is not None and foa_hint:
+                like = f"%{foa_hint.upper()}%"
                 try:
-                    like = f"%{foa_hint.upper()}%"
-                    cands = _candidate_rows(
+                    foa_cands = _candidate_rows(
                         conn, qe, topN,
                         "WHERE d.url ILIKE :like OR d.title ILIKE :like",
                         {"like": like},
                         policy_bias=False,
-                        prefer_grants_domain=False,
                     )
                 except Exception:
-                    cands = []
+                    foa_cands = []
 
             # 2) FTS + vector (bias ON for generic queries)
-            if not cands and qe is not None:
+            cands: List[Dict[str, Any]] = []
+            if qe is not None:
                 try:
                     cands = _candidate_rows(
                         conn, qe, topN,
                         _fts_where_clause(),
                         {"ftsq": query},
                         policy_bias=(foa_hint is None),
-                        prefer_grants_domain=(foa_hint is None),
                     )
                 except sa_exc.DBAPIError:
                     cands = []
@@ -397,13 +400,12 @@ def retrieve_top_chunks(query: str, k: int = 6, foa_hint: Optional[str] = None) 
                     cands = _candidate_rows(
                         conn, qe, topN,
                         policy_bias=(foa_hint is None),
-                        prefer_grants_domain=(foa_hint is None),
                     )
                 except Exception:
                     cands = []
 
             # 4) Keyword-only fallback if still empty
-            if not cands:
+            if not cands and not foa_cands:
                 try:
                     fallback = _keyword_fallback_rows(conn, query, k=k)
                 except Exception:
@@ -411,8 +413,8 @@ def retrieve_top_chunks(query: str, k: int = 6, foa_hint: Optional[str] = None) 
                 if fallback:
                     cands = fallback
 
-            # Choose best available set (prefer cands, else quick)
-            chosen = cands if cands else quick
+            # pick best available set (prefer FOA, then cands, else quick)
+            chosen = foa_cands or cands or quick
             if not chosen:
                 return []
 
@@ -625,8 +627,14 @@ def rag_diagnose(req: DiagnoseRequest):
 # ---------------- Admin: self-check & trace ----------------
 @app.get("/admin/rag_selfcheck", dependencies=[Depends(require_admin)])
 def rag_selfcheck():
-    checks = {}
-    errors = []
+    """
+    Quieter, embedding-based probe to avoid scary InternalError logs:
+    - Count tables
+    - Confirm FTS column exists
+    - Do a small vector probe via embeddings + candidate query
+    """
+    checks: Dict[str, Any] = {}
+    errors: List[str] = []
     try:
         with engine.begin() as conn:
             # counts
@@ -642,7 +650,7 @@ def rag_selfcheck():
             except Exception:
                 checks["fts_due_exists"] = False
 
-            # prefer-biased vector sample using a probe query (falls back if embedding fails)
+            # vector sanity via real embedding probe (no SQL self-distance fallback)
             try:
                 raw = conn.connection.driver_connection
                 register_vector(raw)
@@ -656,19 +664,9 @@ def rag_selfcheck():
                     prefer_grants_domain=True,
                 )
                 checks["vector_rank_sample"] = [r["url"] for r in rows]
-            except Exception:
-                try:
-                    rows = conn.execute(text("""
-                        SELECT d.url
-                        FROM embeddings e
-                        JOIN chunks c ON c.id = e.chunk_id
-                        JOIN documents d ON d.id = c.doc_id
-                        ORDER BY e.embedding <-> e.embedding
-                        LIMIT 5
-                    """)).fetchall()
-                    checks["vector_rank_sample"] = [r.url for r in rows]
-                except Exception as e:
-                    errors.append(f"vector_rank_sample: {e.__class__.__name__}")
+            except Exception as e:
+                checks["vector_rank_sample"] = []
+                errors.append(f"vector_rank_sample_probe: {e.__class__.__name__}")
     except Exception as e:
         errors.append(f"db: {e.__class__.__name__}")
     return {"ok": not errors, "checks": checks, "errors": errors}
@@ -682,19 +680,19 @@ def rag_trace(q: str = Query(..., description="User-like question"), k: int = 6)
     m = FOA_RE.search(q) or NOTICE_RE.search(q)
     foa_hint = m.group(0).upper() if m else None
 
-    trace = {"foa_hint": foa_hint}
-    def urls(rows: List[Dict[str, Any]]) -> List[str]:
-        return [r.get("url") for r in rows]
+    trace: Dict[str, Any] = {"foa_hint": foa_hint}
+    urls = lambda rows: [r.get("url") for r in rows]
 
     try:
         with engine.begin() as conn:
+            # Ensure vector adapter
             try:
                 raw = conn.connection.driver_connection
                 register_vector(raw)
             except Exception:
                 pass
 
-            # stage 0 quick keyword
+            # stage0: quick keyword
             try:
                 s0 = _keyword_fallback_rows(conn, q, k=max(3, min(6, k)))
             except Exception:
@@ -707,59 +705,57 @@ def rag_trace(q: str = Query(..., description="User-like question"), k: int = 6)
             except Exception:
                 qe = None
 
-            # stage 1 FOA-focused
-            s1_foa = []
+            # stage1: FOA-constrained
+            s1 = []
             if qe is not None and foa_hint:
+                like = f"%{foa_hint.upper()}%"
                 try:
-                    like = f"%{foa_hint.upper()}%"
-                    s1_foa = _candidate_rows(
+                    s1 = _candidate_rows(
                         conn, qe, max(12, k*4),
                         "WHERE d.url ILIKE :like OR d.title ILIKE :like",
                         {"like": like},
                         policy_bias=False,
-                        prefer_grants_domain=False,
                     )
                 except Exception:
-                    s1_foa = []
-            trace["stage1_foa"] = urls(s1_foa)
+                    s1 = []
+            trace["stage1_foa"] = urls(s1)
 
-            # stage 2 FTS + vector
+            # stage2: FTS + vector
             s2 = []
-            if qe is not None and not s1_foa:
+            if qe is not None:
                 try:
                     s2 = _candidate_rows(
                         conn, qe, max(12, k*4),
                         _fts_where_clause(), {"ftsq": q},
-                        policy_bias=(foa_hint is None),
-                        prefer_grants_domain=(foa_hint is None),
+                        policy_bias=(foa_hint is None)
                     )
                 except Exception:
                     s2 = []
             trace["stage2_fts_vec"] = urls(s2)
 
-            # stage 3 pure vector
+            # stage3: pure vector
             s3 = []
-            if qe is not None and not s1_foa and not s2:
+            if qe is not None and not s2:
                 try:
                     s3 = _candidate_rows(
                         conn, qe, max(12, k*4),
-                        policy_bias=(foa_hint is None),
-                        prefer_grants_domain=(foa_hint is None),
+                        policy_bias=(foa_hint is None)
                     )
                 except Exception:
                     s3 = []
             trace["stage3_vec_only"] = urls(s3)
 
-            # stage 4 keyword fallback
+            # stage4: keyword fallback
             s4 = []
-            if not s1_foa and not s2 and not s3:
+            if not s1 and not s2 and not s3:
                 try:
                     s4 = _keyword_fallback_rows(conn, q, k=k)
                 except Exception:
                     s4 = []
             trace["stage4_keyword_fallback"] = urls(s4)
 
-            chosen = (s1_foa or s2 or s3 or s4 or s0)[:k]
+            # chosen
+            chosen = (s1 or s2 or s3 or s4 or s0)[:k]
             trace["chosen"] = urls(chosen)
 
     except Exception as e:
