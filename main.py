@@ -170,7 +170,7 @@ def get_foa(foa_number: str):
     return {
         "foa_number": row.foa_number,
         "foa_type": row.foa_type,
-        "title": row.title,   # FIX from earlier revision
+        "title": row.title,   # fixed earlier
         "url": row.url,
         "activity_codes": row.activity_codes or [],
         "participating_ics": row.participating_ics or [],
@@ -249,6 +249,34 @@ def mmr_rerank(q_vec, cand_vecs, k=6, lambda_mult=0.7):
         selected.append(i); remaining.remove(i)
     return selected
 
+# ---- DB vector dimension helpers (to avoid mismatched dims) ----
+def _get_db_vector_dim(conn) -> Optional[int]:
+    """
+    Return vector dimension of embeddings.embedding column, or None if unknown.
+    Uses pgvector's vector_dims() if available.
+    """
+    try:
+        dim = conn.execute(text("SELECT vector_dims(e.embedding) FROM embeddings e LIMIT 1")).scalar()
+        if isinstance(dim, int) and dim > 0:
+            return dim
+    except Exception:
+        pass
+    # Fallback: try length(e.embedding) if extension exposes as array (often not)
+    try:
+        dim2 = conn.execute(text("SELECT cardinality(e.embedding) FROM embeddings e LIMIT 1")).scalar()
+        if isinstance(dim2, int) and dim2 > 0:
+            return dim2
+    except Exception:
+        pass
+    return None
+
+def _dims_match(conn, query_vec: List[float]) -> Tuple[bool, Optional[int]]:
+    db_dim = _get_db_vector_dim(conn)
+    if db_dim is None:
+        return True, None  # can't check; assume ok
+    return (len(query_vec) == db_dim), db_dim
+
+# ---------------- Candidate queries ----------------
 def _candidate_rows(
     conn,
     qe: List[float],
@@ -260,8 +288,7 @@ def _candidate_rows(
 ):
     """
     Always CAST the param to vector to avoid 'vector <-> double precision[]' errors.
-    Optionally bias toward policy/how-to/standard-due-dates pages for generic queries,
-    and prefer grants.nih.gov domain over everything else.
+    Optionally bias toward policy/how-to/standard-due-dates pages and grants.nih.gov domain.
     """
     params = params or {}
 
@@ -311,11 +338,11 @@ def _keyword_fallback_rows(conn, query: str, k: int = 6) -> List[Dict[str, Any]]
     patterns = [
         "%/how-to-apply-application-guide/%",
         "%/due-dates-and-submission-policies/%",
-        "%/due-dates.htm%",                 # legacy page
-        "%/standard-due-dates.htm%",        # specific page
-        "%/submission-policies.htm%",       # nearby page
-        "%/policy/nihgps/%",                # GPS
-        "%/peer-review.htm%",               # overview
+        "%/due-dates.htm%",
+        "%/standard-due-dates.htm%",
+        "%/submission-policies.htm%",
+        "%/policy/nihgps/%",
+        "%/peer-review.htm%",
     ]
     words = [w for w in re.findall(r"[A-Za-z0-9]{3,}", query)][:6]
     like_params = {f"p{i}": p for i, p in enumerate(patterns)}
@@ -348,12 +375,12 @@ def _keyword_fallback_rows(conn, query: str, k: int = 6) -> List[Dict[str, Any]]
     return out[:k]
 
 def _fts_where_clause() -> str:
-    # Loosened: plainto_tsquery is less brittle for short queries
+    # plainto_tsquery handles shorter queries reliably
     return "WHERE c.ts @@ plainto_tsquery('english', :ftsq)"
 
 def _fts_only_rows(conn, query: str, topN: int) -> List[Dict[str, Any]]:
     """
-    FTS ranking without vector scoring (used if embeddings fail).
+    FTS ranking without vector scoring (used if embeddings fail or mismatch dims).
     """
     sql = f"""
         SELECT c.content, d.title, d.url
@@ -367,17 +394,20 @@ def _fts_only_rows(conn, query: str, topN: int) -> List[Dict[str, Any]]:
     rows = conn.execute(text(sql), {"ftsq": query, "n": topN}).fetchall()
     return [{"content": r.content, "title": r.title, "url": r.url, "emb": None} for r in rows]
 
+# ---------------- Retrieval ----------------
 def retrieve_top_chunks(query: str, k: int = 6, foa_hint: str = None) -> List[Dict[str, Any]]:
     """
     Retrieval order:
       0) Quick keyword-first fallback for high-signal policy pages
       1a) FTS pre-filter + vector rank (policy_bias ON for generic queries) with small keyword OR safety net
-      1b) If embeddings unavailable, FTS-only ranking
-      2) Pure vector rank
+          (only if query embedding dimension matches DB column dimension)
+      1b) If embeddings unavailable or dims mismatch, FTS-only ranking
+      2) Pure vector rank (only if dims match)
       3) Keyword fallback
-    Then MMR to diversify results (when embeddings exist).
+    Then MMR to diversify results (when embeddings exist and dims match).
     """
     qe: Optional[List[float]] = None
+    used_model: Optional[str] = None
     try:
         qe, used_model = embed_query(query)
         print(f"[retrieve_top_chunks] embed model used: {used_model}")
@@ -402,9 +432,17 @@ def retrieve_top_chunks(query: str, k: int = 6, foa_hint: str = None) -> List[Di
             except Exception:
                 quick = []
 
-            # 1a) FTS + vector (bias ON for generic queries) with tiny keyword OR
-            cands: List[Dict[str, Any]] = []
+            # Check vector dimension compatibility
+            dims_ok = True
+            db_dim = None
             if qe is not None:
+                dims_ok, db_dim = _dims_match(conn, qe)
+                if not dims_ok:
+                    print(f"[retrieve_top_chunks] vector dim mismatch: db={db_dim}, query={len(qe)}; skipping vector stages")
+
+            # 1a) FTS + vector (with tiny keyword OR) if dims ok
+            cands: List[Dict[str, Any]] = []
+            if qe is not None and dims_ok:
                 try:
                     fts_clause = _fts_where_clause()
                     combined_clause = (
@@ -417,25 +455,29 @@ def retrieve_top_chunks(query: str, k: int = 6, foa_hint: str = None) -> List[Di
                         {"ftsq": query, "kw": f"%{query[:64]}%"},
                         policy_bias=(foa_hint is None),
                     )
-                except sa_exc.DBAPIError:
+                except sa_exc.DBAPIError as e:
+                    print(f"[retrieve_top_chunks] stage1 DBAPIError: {e}")
                     cands = []
-                except Exception:
+                except Exception as e:
+                    print(f"[retrieve_top_chunks] stage1 error: {e}")
                     cands = []
             else:
-                # 1b) FTS-only ranking fallback if embeddings are down
+                # 1b) FTS-only ranking fallback if embeddings are down or mismatched
                 try:
                     cands = _fts_only_rows(conn, query, topN)
-                except Exception:
+                except Exception as e:
+                    print(f"[retrieve_top_chunks] fts-only error: {e}")
                     cands = []
 
-            # 2) Pure vector fallback
-            if not cands and qe is not None:
+            # 2) Pure vector fallback (only if dims ok)
+            if not cands and qe is not None and dims_ok:
                 try:
                     cands = _candidate_rows(
                         conn, qe, topN,
                         policy_bias=(foa_hint is None),
                     )
-                except Exception:
+                except Exception as e:
+                    print(f"[retrieve_top_chunks] vec-only error: {e}")
                     cands = []
 
             # 3) Keyword-only fallback if still empty
@@ -451,8 +493,8 @@ def retrieve_top_chunks(query: str, k: int = 6, foa_hint: str = None) -> List[Di
             if not chosen:
                 return []
 
-            # If embeddings present for candidates, apply MMR; else return as-is
-            if qe is not None and all(c.get("emb") for c in chosen):
+            # If embeddings present for candidates and dims ok, apply MMR; else return as-is
+            if qe is not None and dims_ok and all(c.get("emb") for c in chosen):
                 vecs = [c["emb"] for c in chosen]
                 keep = mmr_rerank(qe, vecs, k=k, lambda_mult=0.7)
                 return [chosen[i] for i in keep]
@@ -660,7 +702,7 @@ def rag_diagnose(req: DiagnoseRequest):
         })
     return {"count": len(out), "items": out}
 
-# ---------------- Admin: self-check, trace, embed probe ----------------
+# ---------------- Admin: self-check, trace, embed probe, vec info ----------------
 @app.get("/admin/rag_selfcheck", dependencies=[Depends(require_admin)])
 def rag_selfcheck():
     checks = {}
@@ -680,7 +722,13 @@ def rag_selfcheck():
             except Exception:
                 checks["fts_due_exists"] = False
 
-            # vector ops present? sanity order by
+            # DB vector dim
+            try:
+                checks["db_vector_dim"] = _get_db_vector_dim(conn)
+            except Exception:
+                checks["db_vector_dim"] = None
+
+            # vector ops present? sanity order by (no query vector used here)
             try:
                 raw = conn.connection.driver_connection
                 register_vector(raw)
@@ -708,12 +756,13 @@ def rag_selfcheck():
 def rag_trace(q: str = Query(..., description="User-like question"), k: int = 6):
     """
     Shows what each retrieval stage returns (urls only) to pinpoint where it goes empty.
+    Also reports vector dimension mismatch info when applicable.
     """
     q = q.strip()
     m = FOA_RE.search(q) or NOTICE_RE.search(q)
     foa_hint = m.group(0).upper() if m else None
 
-    trace = {"foa_hint": foa_hint}
+    trace: Dict[str, Any] = {"foa_hint": foa_hint}
     urls = lambda rows: [r.get("url") for r in rows]
 
     try:
@@ -740,9 +789,18 @@ def rag_trace(q: str = Query(..., description="User-like question"), k: int = 6)
                 qe = None
                 trace["embed_model_used"] = None
 
-            # stage 1 FOA-focused (not used if no hint)
+            # dim check
+            dims_ok = True
+            db_dim = None
+            if qe is not None:
+                dims_ok, db_dim = _dims_match(conn, qe)
+            trace["db_vector_dim"] = db_dim
+            trace["query_vector_dim"] = (len(qe) if qe is not None else None)
+            trace["dims_match"] = (dims_ok if qe is not None else None)
+
+            # stage 1 FOA-focused (not used if no hint or dims mismatch)
             s1 = []
-            if qe is not None and foa_hint:
+            if qe is not None and dims_ok and foa_hint:
                 like = f"%{foa_hint.upper()}%"
                 try:
                     s1 = _candidate_rows(
@@ -756,7 +814,7 @@ def rag_trace(q: str = Query(..., description="User-like question"), k: int = 6)
 
             # stage 2 FTS + vector (with tiny keyword OR) OR FTS-only fallback
             s2 = []
-            if qe is not None:
+            if qe is not None and dims_ok:
                 try:
                     fts_clause = _fts_where_clause()
                     combined_clause = (
@@ -777,9 +835,9 @@ def rag_trace(q: str = Query(..., description="User-like question"), k: int = 6)
                     s2 = []
             trace["stage2_fts_vec"] = urls(s2)
 
-            # stage 3 pure vector
+            # stage 3 pure vector (only if dims ok)
             s3 = []
-            if qe is not None and not s2:
+            if qe is not None and dims_ok and not s2:
                 try:
                     s3 = _candidate_rows(
                         conn, qe, max(12, k*4),
@@ -817,3 +875,19 @@ def embed_probe(q: str = Query("hello NIH grants", description="short test strin
         return {"ok": True, "model_used": used, "dim": len(vec)}
     except Exception as e:
         return {"ok": False, "error": f"{e.__class__.__name__}: {e}"}
+
+@app.get("/admin/vec_info", dependencies=[Depends(require_admin)])
+def vec_info():
+    """
+    Report DB vector dimension and configured embedding model/fallbacks.
+    """
+    try:
+        with engine.begin() as conn:
+            db_dim = _get_db_vector_dim(conn)
+    except Exception:
+        db_dim = None
+    return {
+        "db_vector_dim": db_dim,
+        "embed_model": EMBED_MODEL,
+        "embed_fallbacks": EMBED_FALLBACKS,
+    }
