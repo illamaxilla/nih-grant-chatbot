@@ -170,7 +170,7 @@ def get_foa(foa_number: str):
     return {
         "foa_number": row.foa_number,
         "foa_type": row.foa_type,
-        "title": row.title,   # FIX: was r.title
+        "title": row.title,   # FIX from earlier revision
         "url": row.url,
         "activity_codes": row.activity_codes or [],
         "participating_ics": row.participating_ics or [],
@@ -215,7 +215,6 @@ def embed_query(q: str) -> Tuple[List[float], str]:
             return vec, used
         except Exception as e:
             last_err = e
-            # Log to stdout so Render logs show the exact error/model
             print(f"[embed_query] failed model={m}: {e.__class__.__name__}: {e}")
             continue
     raise last_err if last_err else RuntimeError("embedding_failed")
@@ -283,7 +282,6 @@ def _candidate_rows(
         """)
 
     if prefer_grants_domain:
-        # Smaller is better; lower scores for grants.nih.gov, higher for everything else.
         penalties.append("""
             + CASE
                 WHEN d.url ILIKE 'https://grants.nih.gov/%' THEN -0.20
@@ -350,8 +348,8 @@ def _keyword_fallback_rows(conn, query: str, k: int = 6) -> List[Dict[str, Any]]
     return out[:k]
 
 def _fts_where_clause() -> str:
-    # Prefer websearch_to_tsquery for lenient matching
-    return "WHERE c.ts @@ websearch_to_tsquery('english', :ftsq)"
+    # Loosened: plainto_tsquery is less brittle for short queries
+    return "WHERE c.ts @@ plainto_tsquery('english', :ftsq)"
 
 def _fts_only_rows(conn, query: str, topN: int) -> List[Dict[str, Any]]:
     """
@@ -362,7 +360,7 @@ def _fts_only_rows(conn, query: str, topN: int) -> List[Dict[str, Any]]:
         FROM chunks c
         JOIN documents d ON d.id = c.doc_id
         {_fts_where_clause()}
-        ORDER BY ts_rank(c.ts, websearch_to_tsquery('english', :ftsq)) DESC,
+        ORDER BY ts_rank(c.ts, plainto_tsquery('english', :ftsq)) DESC,
                  length(c.content) DESC
         LIMIT :n
     """
@@ -373,7 +371,7 @@ def retrieve_top_chunks(query: str, k: int = 6, foa_hint: str = None) -> List[Di
     """
     Retrieval order:
       0) Quick keyword-first fallback for high-signal policy pages
-      1a) FTS pre-filter + vector rank (policy_bias ON for generic queries)
+      1a) FTS pre-filter + vector rank (policy_bias ON for generic queries) with small keyword OR safety net
       1b) If embeddings unavailable, FTS-only ranking
       2) Pure vector rank
       3) Keyword fallback
@@ -381,8 +379,7 @@ def retrieve_top_chunks(query: str, k: int = 6, foa_hint: str = None) -> List[Di
     """
     qe: Optional[List[float]] = None
     try:
-        qe, used_model = embed_query(query)  # Python list + model used
-        # Emit once so logs show which model succeeded
+        qe, used_model = embed_query(query)
         print(f"[retrieve_top_chunks] embed model used: {used_model}")
     except Exception as e:
         print(f"[retrieve_top_chunks] embeddings unavailable: {e.__class__.__name__}: {e}")
@@ -399,20 +396,25 @@ def retrieve_top_chunks(query: str, k: int = 6, foa_hint: str = None) -> List[Di
             except Exception:
                 pass
 
-            # 0) Quick keyword-first hit
+            # 0) Quick keyword-first hit to catch policy pages immediately
             try:
                 quick = _keyword_fallback_rows(conn, query, k=max(3, min(6, k)))
             except Exception:
                 quick = []
 
-            # 1a) FTS + vector (bias ON for generic queries)
+            # 1a) FTS + vector (bias ON for generic queries) with tiny keyword OR
             cands: List[Dict[str, Any]] = []
             if qe is not None:
                 try:
+                    fts_clause = _fts_where_clause()
+                    combined_clause = (
+                        f"{fts_clause} OR "
+                        "(d.url ILIKE '%/due-dates%' OR d.title ILIKE :kw OR c.content ILIKE :kw)"
+                    )
                     cands = _candidate_rows(
                         conn, qe, topN,
-                        _fts_where_clause(),
-                        {"ftsq": query},
+                        combined_clause,
+                        {"ftsq": query, "kw": f"%{query[:64]}%"},
                         policy_bias=(foa_hint is None),
                     )
                 except sa_exc.DBAPIError:
@@ -752,13 +754,18 @@ def rag_trace(q: str = Query(..., description="User-like question"), k: int = 6)
                     s1 = []
             trace["stage1_foa"] = urls(s1)
 
-            # stage 2 FTS + vector OR FTS-only fallback
+            # stage 2 FTS + vector (with tiny keyword OR) OR FTS-only fallback
             s2 = []
             if qe is not None:
                 try:
+                    fts_clause = _fts_where_clause()
+                    combined_clause = (
+                        f"{fts_clause} OR "
+                        "(d.url ILIKE '%/due-dates%' OR d.title ILIKE :kw OR c.content ILIKE :kw)"
+                    )
                     s2 = _candidate_rows(
                         conn, qe, max(12, k*4),
-                        _fts_where_clause(), {"ftsq": q},
+                        combined_clause, {"ftsq": q, "kw": f"%{q[:64]}%"},
                         policy_bias=(foa_hint is None)
                     )
                 except Exception:
